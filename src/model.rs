@@ -76,6 +76,15 @@ pub enum Owner {
     ObjectConst(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkipReason {
+    Generic,
+    RestParam,
+    NoParams,
+    Overload,
+}
+
 #[derive(Debug)]
 pub struct FnDecl {
     pub name: String,
@@ -84,7 +93,9 @@ pub struct FnDecl {
     pub line: u32,
     pub end_line: u32,
     pub exported: bool,
-    /// False for generics, rest params, destructured params, zero params, or no body.
+    /// Why this declaration cannot be analyzed, if it can't.
+    pub skip: Option<SkipReason>,
+    /// Convenience: `skip.is_none()`.
     pub eligible: bool,
 }
 
@@ -214,7 +225,17 @@ impl Default for Options {
 pub struct Stats {
     pub files: usize,
     pub decls: usize,
+    /// Eligible, not escaped, and with at least one observed call.
     pub analyzed: usize,
+    pub skipped_generic: usize,
+    pub skipped_overload: usize,
+    pub skipped_rest_param: usize,
+    pub skipped_no_params: usize,
+    /// Referenced outside callee position (or hit by a conservative taint).
+    pub escaped: usize,
+    /// Eligible and un-escaped but with zero visible direct calls —
+    /// dead-function candidates under the closed-world assumption.
+    pub uncalled: usize,
     pub parse_error_files: usize,
     pub read_error_files: usize,
 }

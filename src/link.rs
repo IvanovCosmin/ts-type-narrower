@@ -425,19 +425,31 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
             .cmp(&(&b.file, b.line, &b.function_name, &b.param, &b.path))
     });
 
-    let stats = Stats {
+    let mut stats = Stats {
         files: modules.len(),
         decls: flat.len(),
-        analyzed: flat
-            .iter()
-            .enumerate()
-            .filter(|(ti, (mid, di))| {
-                modules[*mid].decls[*di].eligible && !states[*ti].escaped && !states[*ti].calls.is_empty()
-            })
-            .count(),
         parse_error_files,
         read_error_files,
+        ..Default::default()
     };
+    for (ti, &(mid, di)) in flat.iter().enumerate() {
+        let d = &modules[mid].decls[di];
+        match d.skip {
+            Some(SkipReason::Generic) => stats.skipped_generic += 1,
+            Some(SkipReason::Overload) => stats.skipped_overload += 1,
+            Some(SkipReason::RestParam) => stats.skipped_rest_param += 1,
+            Some(SkipReason::NoParams) => stats.skipped_no_params += 1,
+            None => {
+                if states[ti].escaped {
+                    stats.escaped += 1;
+                } else if states[ti].calls.is_empty() {
+                    stats.uncalled += 1;
+                } else {
+                    stats.analyzed += 1;
+                }
+            }
+        }
+    }
 
     if opts.timing {
         eprintln!(

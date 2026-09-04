@@ -101,11 +101,21 @@ fn main() -> ExitCode {
                 println!("\n{} finding(s)", findings.len());
             }
             if !opts.quiet {
+                let pct = |n: usize| if stats.decls == 0 { 0.0 } else { n as f64 * 100.0 / stats.decls as f64 };
                 let mut summary = format!(
-                    "overwide: {} files, {} functions ({} analyzed), {} finding(s)",
+                    "overwide: {} files, {} functions — analyzed {} ({:.0}%), escaped {} ({:.0}%), never-called {} ({:.0}%), generic {}, overloaded {}, rest-param {}, zero-param {}; {} finding(s)",
                     stats.files,
                     stats.decls,
                     stats.analyzed,
+                    pct(stats.analyzed),
+                    stats.escaped,
+                    pct(stats.escaped),
+                    stats.uncalled,
+                    pct(stats.uncalled),
+                    stats.skipped_generic,
+                    stats.skipped_overload,
+                    stats.skipped_rest_param,
+                    stats.skipped_no_params,
                     findings.len()
                 );
                 if stats.parse_error_files > 0 {

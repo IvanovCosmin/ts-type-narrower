@@ -77,9 +77,11 @@ pub fn extract_module(path: &Path, rel: String, source: &str, specmap: &Specifie
     }
     for d in &mut info.decls {
         if seen[&(d.owner.clone(), d.name.clone())] > 1 {
+            d.skip = Some(SkipReason::Overload);
             d.eligible = false;
         }
         if d.owner == Owner::Free && bodyless_fns.contains(&d.name) {
+            d.skip = Some(SkipReason::Overload);
             d.eligible = false;
         }
         // Export via modifier was set at declaration time; extend to names in
@@ -320,6 +322,7 @@ fn prepass_declaration(
             if !bodyless.is_empty() {
                 for d in &mut info.decls {
                     if d.owner == Owner::Free && bodyless.contains(&d.name) {
+                        d.skip = Some(SkipReason::Overload);
                         d.eligible = false;
                     }
                 }
@@ -389,7 +392,7 @@ fn prepass_function(
         bodyless_fns.insert(name);
         return;
     }
-    let eligible = f.type_parameters.is_none() && params_eligible(&f.params);
+    let skip = skip_reason_of(f.type_parameters.is_some(), &f.params);
     info.decls.push(FnDecl {
         name,
         owner: Owner::Free,
@@ -397,7 +400,8 @@ fn prepass_function(
         line: line_of(line_starts, f.span.start),
         end_line: line_of(line_starts, f.span.end),
         exported: exported_ctx,
-        eligible,
+        skip,
+        eligible: skip.is_none(),
     });
 }
 
@@ -431,7 +435,7 @@ fn prepass_class(
             if func.body.is_none() {
                 continue;
             }
-            let eligible = func.type_parameters.is_none() && params_eligible(&func.params);
+            let skip = skip_reason_of(func.type_parameters.is_some(), &func.params);
             info.decls.push(FnDecl {
                 name: key.name.to_string(),
                 owner: Owner::Class(class_name.clone()),
@@ -439,7 +443,8 @@ fn prepass_class(
                 line: line_of(line_starts, m.span.start),
                 end_line: line_of(line_starts, m.span.end),
                 exported: exported_ctx,
-                eligible,
+                skip,
+                eligible: skip.is_none(),
             });
         }
     }
@@ -487,7 +492,7 @@ fn classify_declarator(
     match &d.init {
         Some(Expression::ArrowFunctionExpression(a)) => {
             if let Some(info) = info {
-                let eligible = a.type_parameters.is_none() && params_eligible(&a.params);
+                let skip = skip_reason_of(a.type_parameters.is_some(), &a.params);
                 info.decls.push(FnDecl {
                     name: name.to_string(),
                     owner: Owner::Free,
@@ -495,7 +500,8 @@ fn classify_declarator(
                     line: line_of(line_starts, a.span.start),
                     end_line: line_of(line_starts, a.span.end),
                     exported: exported_ctx,
-                    eligible,
+                    skip,
+                    eligible: skip.is_none(),
                 });
                 Binding::Fn
             } else {
@@ -504,7 +510,11 @@ fn classify_declarator(
         }
         Some(Expression::FunctionExpression(f)) => {
             if let Some(info) = info {
-                let eligible = f.type_parameters.is_none() && params_eligible(&f.params) && f.body.is_some();
+                let skip = if f.body.is_none() {
+                    Some(SkipReason::Overload)
+                } else {
+                    skip_reason_of(f.type_parameters.is_some(), &f.params)
+                };
                 info.decls.push(FnDecl {
                     name: name.to_string(),
                     owner: Owner::Free,
@@ -512,7 +522,8 @@ fn classify_declarator(
                     line: line_of(line_starts, f.span.start),
                     end_line: line_of(line_starts, f.span.end),
                     exported: exported_ctx,
-                    eligible,
+                    skip,
+                    eligible: skip.is_none(),
                 });
                 Binding::Fn
             } else {
@@ -537,7 +548,7 @@ fn classify_declarator(
                         continue;
                     }
                     has_methods = true;
-                    let eligible = type_params.is_none() && params_eligible(params);
+                    let skip = skip_reason_of(type_params.is_some(), params);
                     info.decls.push(FnDecl {
                         name: key.name.to_string(),
                         owner: Owner::ObjectConst(name.to_string()),
@@ -545,7 +556,8 @@ fn classify_declarator(
                         line: line_of(line_starts, span.start),
                         end_line: line_of(line_starts, span.end),
                         exported: exported_ctx,
-                        eligible,
+                        skip,
+                        eligible: skip.is_none(),
                     });
                 }
             }
@@ -601,6 +613,20 @@ fn simple_literal(e: &Expression) -> Option<Observed> {
     }
 }
 
+fn skip_reason_of(has_type_params: bool, params: &FormalParameters) -> Option<SkipReason> {
+    if has_type_params {
+        return Some(SkipReason::Generic);
+    }
+    if params.rest.is_some() {
+        return Some(SkipReason::RestParam);
+    }
+    if params.items.is_empty() {
+        return Some(SkipReason::NoParams);
+    }
+    None
+}
+
+#[allow(dead_code)]
 fn params_eligible(params: &FormalParameters) -> bool {
     // Rest params shift nothing before them but complicate omitted-arg logic;
     // functions carrying one stay skipped. Destructured params are fine: an
