@@ -6,6 +6,6 @@ pub mod narrow;
 pub mod resolve;
 
 pub use link::analyze;
-pub use model::{Finding, Options};
+pub use model::{Analysis, Finding, Options};
 pub mod genproj;
 pub mod workspace;

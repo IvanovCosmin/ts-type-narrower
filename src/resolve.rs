@@ -21,7 +21,7 @@ pub enum Ty {
     Null,
     /// any / unknown / uninterpretable value: assignable both ways, covers all.
     AnyLike,
-    EnumLit { enum_name: String, member: String },
+    EnumLit { enum_name: String, member: String, is_string: bool },
     Union(Vec<Ty>),
     Object(Vec<RProp>),
     Arr(Box<Ty>),
@@ -68,8 +68,7 @@ impl<'m> Resolver<'m> {
                         t => out.push(t),
                     }
                 }
-                dedupe(&mut out);
-                Ty::Union(out)
+                collapse_union(out)
             }
             TypeExpr::ObjectLit(props) => Ty::Object(
                 props
@@ -131,7 +130,7 @@ impl<'m> Resolver<'m> {
             return Ty::Union(
                 members
                     .iter()
-                    .map(|mem| Ty::EnumLit { enum_name: name.to_string(), member: mem.clone() })
+                    .map(|(mem, is_string)| Ty::EnumLit { enum_name: name.to_string(), member: mem.clone(), is_string: *is_string })
                     .collect(),
             );
         }
@@ -202,14 +201,14 @@ impl<'m> Resolver<'m> {
             Observed::EnumMember { enum_name, member } => {
                 let m = &self.modules[mid];
                 if let Some(members) = m.enums.get(enum_name) {
-                    if members.contains(member) {
-                        return Ty::EnumLit { enum_name: enum_name.clone(), member: member.clone() };
+                    if let Some((_, is_string)) = members.iter().find(|(n, _)| n == member) {
+                        return Ty::EnumLit { enum_name: enum_name.clone(), member: member.clone(), is_string: *is_string };
                     }
                 } else if let Some((Some(path), imported)) = m.imports.get(enum_name) {
                     if let Some(&mid2) = self.by_path.get(path) {
                         if let Some(members) = self.modules[mid2].enums.get(imported) {
-                            if members.contains(member) {
-                                return Ty::EnumLit { enum_name: imported.clone(), member: member.clone() };
+                            if let Some((_, is_string)) = members.iter().find(|(n, _)| n == member) {
+                                return Ty::EnumLit { enum_name: imported.clone(), member: member.clone(), is_string: *is_string };
                             }
                         }
                     }
@@ -245,8 +244,7 @@ fn project_elem(base: &Ty) -> Ty {
                     t => out.push(t),
                 }
             }
-            dedupe(&mut out);
-            Ty::Union(out)
+            collapse_union(out)
         }
         Ty::AnyLike => Ty::AnyLike,
         _ => Ty::AnyLike,
@@ -281,8 +279,7 @@ fn project(base: &Ty, prop: &str) -> Ty {
                     t => out.push(t),
                 }
             }
-            dedupe(&mut out);
-            Ty::Union(out)
+            collapse_union(out)
         }
         _ => Ty::AnyLike,
     }
@@ -291,6 +288,20 @@ fn project(base: &Ty, prop: &str) -> Ty {
 fn dedupe(v: &mut Vec<Ty>) {
     let mut seen: HashSet<Ty> = HashSet::with_capacity(v.len());
     v.retain(|t| seen.insert(t.clone()));
+}
+
+/// `T | any` IS `any` (tsc semantics). Collapsing at construction keeps the
+/// narrowing fast path and the structural path in agreement.
+fn collapse_union(mut v: Vec<Ty>) -> Ty {
+    if v.iter().any(|t| matches!(t, Ty::AnyLike)) {
+        return Ty::AnyLike;
+    }
+    dedupe(&mut v);
+    if v.len() == 1 {
+        v.pop().unwrap()
+    } else {
+        Ty::Union(v)
+    }
 }
 
 pub fn print_ty(t: &Ty) -> String {
@@ -304,7 +315,7 @@ pub fn print_ty(t: &Ty) -> String {
         Ty::Undefined => "undefined".to_string(),
         Ty::Null => "null".to_string(),
         Ty::AnyLike => "any".to_string(),
-        Ty::EnumLit { enum_name, member } => format!("{enum_name}.{member}"),
+        Ty::EnumLit { enum_name, member, .. } => format!("{enum_name}.{member}"),
         Ty::Union(parts) => parts.iter().map(print_ty).collect::<Vec<_>>().join(" | "),
         Ty::Object(props) => {
             let mut s = String::from("{ ");

@@ -20,12 +20,19 @@ bails to "no finding" on anything it cannot prove.
 
 ```
 cargo build --release
-./target/release/overwide <dir>                      # analyze every .ts/.tsx under dir
-./target/release/overwide <dir> --diff 'origin/main...HEAD'
-./target/release/overwide <dir> --json
-./target/release/overwide <dir> --fail-on-findings   # exit 1 when findings exist
-./target/release/overwide <dir> --respect-exports    # open-world: skip exported functions
+overwide <dir|file>                    # analyze every .ts/.tsx/.mts/.cts under dir
+overwide <dir> --diff 'origin/main...HEAD'
+overwide <dir> --json                  # {version, findings, stats, uncalled*, warnings}
+overwide <dir> --list-uncalled         # dead-function candidates (never called)
+overwide <dir> --fail-on-findings      # exit 1 when findings exist
+overwide <dir> --respect-exports       # open-world: skip exported functions
+overwide <dir> --max-depth N --quiet --timing --version
 ```
+
+Exit codes: 0 = ran (findings or not); 1 = findings with `--fail-on-findings`;
+2 = usage/IO/git error. `--quiet` suppresses only the stderr summary line —
+soundness warnings (parse errors, unreadable files, sub-root analysis) always
+print and are included in the JSON report's `warnings`.
 
 `--diff <base>` runs `git diff -U0 <base>` and restricts *reporting* to
 functions whose declaration overlaps a changed line; call-site discovery still
@@ -83,10 +90,12 @@ denote.** Concretely:
 Module resolution covers: relative imports (including dotted filenames like
 `foo.service.ts` and `.js`/`.mjs`-suffixed NodeNext specifiers), named and
 default exports/imports, namespace imports (`import * as ns` — `ns.f(...)` is
-a real call), `const m = await import("./x")`, re-export chains
-(`export { x } from`, `export * from`, barrel files), tsconfig
-`paths`/`baseUrl` mappings, and workspace package names (`package.json`
-`name` fields found under the analysis root).
+a real call), `const m = await import("./x")` and `require("./x")`, re-export
+chains in every form (`export { x } from`, `export * from`,
+`export * as ns from`, and import-then-export barrels), tsconfig
+`paths`/`baseUrl` from every `tsconfig*.json` under the root (BOM-tolerant
+JSONC), and workspace package names (`package.json` `name` fields). A private
+local declaration never satisfies an import of the same name.
 
 A function is skipped entirely when analysis would be unsound for it:
 any reference outside callee position, overloads, generics, rest parameters.
@@ -123,7 +132,7 @@ the one place the guarantee is knowingly best-effort).
   `workspace.rs` (tsconfig paths + workspace package names), `link.rs`
   (cross-module linking + taints + orchestration), `resolve.rs` (memoized type
   resolution), `narrow.rs` (the narrowing core), `diff.rs`, `genproj.rs`.
-- `fixture/` — a handcrafted TypeScript project with 29 cases (including
+- `fixture/` — a handcrafted TypeScript project with 35 cases (including
   regression cases for barrel files, default/namespace imports, shadowing,
   local type shadowing, subsumed constituents, dotted filenames, JSX member
   tags) and ground truth in `fixture/expected.json`; `npm run check:fixture`
@@ -137,11 +146,13 @@ Measured in this container (release build):
 
 | project | files | functions | size | wall time |
 |---|---|---|---|---|
-| fixture | 29 | ~40 | ~35 KB | 4 ms |
+| fixture | 46 | ~75 | ~25 KB | 6 ms |
 | zod (real) | 505 | 1,318 | — | 86 ms |
 | excalidraw (real) | 629 | 2,138 | — | 114 ms |
+| bluesky social-app (real) | 1,802 | 3,991 | — | 141 ms |
+| outline (real) | 2,178 | 3,313 | — | 180 ms |
 | generated | 2,000 | 22,000 | 7.9 MB | 154 ms |
-| generated | 10,000 | 110,000 | 40 MB | ~600 ms |
+| generated | 10,000 | 110,000 | 40 MB | ~700 ms |
 
 Finding counts on generated projects match the generator's expected count
 exactly. Pathological inputs that previously degraded — 2,000-constituent

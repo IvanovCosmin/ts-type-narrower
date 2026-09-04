@@ -69,6 +69,21 @@ pub fn extract_module(path: &Path, rel: String, source: &str, specmap: &Specifie
         prepass_stmt(stmt, source, path, specmap, &line_starts, &mut info, &mut module_scope, &mut exported, &mut bodyless_fns);
     }
 
+    // Import-then-export barrels: `import { x } from "./y"; export { x as z };`
+    // must act as a re-export edge, or calls through the barrel vanish.
+    let specs = std::mem::take(&mut info.export_specifiers);
+    for (local, exp) in &specs {
+        if let Some(entry) = info.imports.get(local) {
+            info.reexports_named.entry(exp.clone()).or_insert_with(|| entry.clone());
+        }
+    }
+    info.export_specifiers = specs;
+    if let Some(d) = info.default_export.clone() {
+        if let Some(entry) = info.imports.get(&d) {
+            info.reexports_named.entry("default".to_string()).or_insert_with(|| entry.clone());
+        }
+    }
+
     // Overloads / merged declarations: any name with a bodyless signature or a
     // duplicate implementation is ineligible.
     let mut seen: HashMap<(Owner, String), usize> = HashMap::new();
@@ -97,12 +112,42 @@ pub fn extract_module(path: &Path, rel: String, source: &str, specmap: &Specifie
         }
     }
 
+    // Module-level `const c = new C()` where C is not a class/import in module
+    // scope must not bind as a tracked instance.
+    let fixups: Vec<String> = module_scope
+        .iter()
+        .filter_map(|(name, b)| {
+            if let Binding::Instance(cls) = b {
+                match module_scope.get(cls) {
+                    Some(Binding::ClassDecl) | Some(Binding::Import) => None,
+                    _ => Some(name.clone()),
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+    for name in fixups {
+        module_scope.insert(name, Binding::LocalOther);
+    }
+
+    // Namespace bindings whose module didn't resolve: if such a VALUE escapes,
+    // member accesses anywhere may reach its (unknown) exports — that is what
+    // activates the project-wide MemberFreeNamed taints.
+    let unresolved_ns: HashSet<String> = info
+        .imports
+        .iter()
+        .filter(|(_, (p, n))| p.is_none() && n == "*")
+        .map(|(k, _)| k.clone())
+        .collect();
+
     // ---- Usage pass. ----
     let mut v = UsageVisitor {
         src: source,
         module_path: path,
         specmap,
         line_starts: &line_starts,
+        unresolved_ns: &unresolved_ns,
         class_stack: Vec::new(),
         scopes: vec![module_scope],
         type_shadows: vec![HashSet::new()],
@@ -263,7 +308,10 @@ fn prepass_stmt(
                 }
             } else {
                 for s in &d.specifiers {
-                    exported.insert(export_name_to_string(&s.local));
+                    let local = export_name_to_string(&s.local);
+                    let exp = export_name_to_string(&s.exported);
+                    exported.insert(local.clone());
+                    info.export_specifiers.push((local, exp));
                 }
             }
             if let Some(decl) = &d.declaration {
@@ -272,12 +320,13 @@ fn prepass_stmt(
         }
         Statement::ExportAllDeclaration(d) => {
             info.is_module = true;
-            // `export * as ns from ...` re-exports a namespace object; we model
-            // it as an unresolvable star so misses taint instead of vanishing.
-            if d.exported.is_some() {
-                info.reexports_star.push(None);
-            } else {
-                info.reexports_star.push(resolve_import(path, d.source.value.as_str(), specmap));
+            let src_path = resolve_import(path, d.source.value.as_str(), specmap);
+            match &d.exported {
+                // `export * as ns from ...`: a named namespace re-export.
+                Some(name) => {
+                    info.reexports_named.insert(export_name_to_string(name), (src_path, "*".to_string()));
+                }
+                None => info.reexports_star.push(src_path),
             }
         }
         Statement::ExportDefaultDeclaration(d) => {
@@ -372,14 +421,17 @@ fn prepass_interface(t: &TSInterfaceDeclaration, src: &str, info: &mut ModuleInf
 
 fn prepass_enum(t: &TSEnumDeclaration, info: &mut ModuleInfo, scope: &mut HashMap<String, Binding>) {
     let name = t.id.name.to_string();
-    let members: Vec<String> = t
+    let members: Vec<(String, bool)> = t
         .body
         .members
         .iter()
-        .filter_map(|m| match &m.id {
-            TSEnumMemberName::Identifier(n) => Some(n.name.to_string()),
-            TSEnumMemberName::String(s) => Some(s.value.to_string()),
-            _ => None,
+        .filter_map(|m| {
+            let is_string = matches!(m.initializer, Some(Expression::StringLiteral(_)));
+            match &m.id {
+                TSEnumMemberName::Identifier(n) => Some((n.name.to_string(), is_string)),
+                TSEnumMemberName::String(s) => Some((s.value.to_string(), is_string)),
+                _ => None,
+            }
         })
         .collect();
     // Merged enum declarations: extend, don't overwrite.
@@ -411,6 +463,7 @@ fn prepass_function(
         line: line_of(line_starts, f.span.start),
         end_line: line_of(line_starts, f.span.end),
         exported: exported_ctx,
+        non_public: false,
         skip,
         eligible: skip.is_none(),
     });
@@ -427,6 +480,7 @@ fn prepass_class(
     let Some(id) = &c.id else { return };
     let class_name = id.name.to_string();
     scope.insert(class_name.clone(), Binding::ClassDecl);
+    info.classes_declared.insert(class_name.clone());
     match &c.super_class {
         Some(Expression::Identifier(sup)) => {
             info.class_extends.insert(class_name.clone(), sup.name.to_string());
@@ -464,6 +518,10 @@ fn prepass_class(
                 line: line_of(line_starts, m.span.start),
                 end_line: line_of(line_starts, m.span.end),
                 exported: exported_ctx,
+                non_public: matches!(
+                    m.accessibility,
+                    Some(TSAccessibility::Private) | Some(TSAccessibility::Protected)
+                ),
                 skip,
                 eligible: skip.is_none(),
             });
@@ -521,6 +579,7 @@ fn classify_declarator(
                     line: line_of(line_starts, a.span.start),
                     end_line: line_of(line_starts, a.span.end),
                     exported: exported_ctx,
+                    non_public: false,
                     skip,
                     eligible: skip.is_none(),
                 });
@@ -543,6 +602,7 @@ fn classify_declarator(
                     line: line_of(line_starts, f.span.start),
                     end_line: line_of(line_starts, f.span.end),
                     exported: exported_ctx,
+                    non_public: false,
                     skip,
                     eligible: skip.is_none(),
                 });
@@ -577,6 +637,7 @@ fn classify_declarator(
                         line: line_of(line_starts, span.start),
                         end_line: line_of(line_starts, span.end),
                         exported: exported_ctx,
+                        non_public: false,
                         skip,
                         eligible: skip.is_none(),
                     });
@@ -613,14 +674,14 @@ fn classify_declarator(
 /// literal specifier — all produce a module-namespace value.
 fn dynamic_import_specifier(init: Option<&Expression>) -> Option<String> {
     let e = init?;
-    let inner = match e {
-        Expression::AwaitExpression(a) => &a.argument,
-        other => other,
-    };
-    match inner {
-        Expression::ImportExpression(imp) => {
-            if let Expression::StringLiteral(s) = &imp.source {
-                return Some(s.value.to_string());
+    // A bare `import(...)` is a Promise, not a namespace — only the awaited
+    // form yields the namespace value directly.
+    match e {
+        Expression::AwaitExpression(a) => {
+            if let Expression::ImportExpression(imp) = &a.argument {
+                if let Expression::StringLiteral(s) = &imp.source {
+                    return Some(s.value.to_string());
+                }
             }
             None
         }
@@ -689,15 +750,6 @@ fn skip_reason_of(has_type_params: bool, params: &FormalParameters) -> Option<Sk
         return Some(SkipReason::NoParams);
     }
     None
-}
-
-#[allow(dead_code)]
-fn params_eligible(params: &FormalParameters) -> bool {
-    // Rest params shift nothing before them but complicate omitted-arg logic;
-    // functions carrying one stay skipped. Destructured params are fine: an
-    // object pattern analyzes against its annotation, an array pattern simply
-    // yields no declared type for that position.
-    !(params.rest.is_some() || params.items.is_empty())
 }
 
 /// Display name for a parameter position.
@@ -872,6 +924,39 @@ fn collect_refs<'a>(te: &'a TypeExpr, out: &mut Vec<&'a str>) {
 // instead of wrongly binding to an outer declaration.
 // ---------------------------------------------------------------------------
 
+/// Immediate (non-nested) declarations of one statement — nested blocks get
+/// their own frames when visited.
+fn scan_immediate(stmt: &Statement, values: &mut HashMap<String, Binding>, types: &mut HashSet<String>) {
+    match stmt {
+        Statement::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                bind_pattern_names(&d.id, values);
+            }
+        }
+        Statement::FunctionDeclaration(f) => {
+            if let Some(id) = &f.id {
+                values.insert(id.name.to_string(), Binding::LocalOther);
+            }
+        }
+        Statement::ClassDeclaration(c) => {
+            if let Some(id) = &c.id {
+                values.insert(id.name.to_string(), Binding::LocalOther);
+            }
+        }
+        Statement::TSTypeAliasDeclaration(t) => {
+            types.insert(t.id.name.to_string());
+        }
+        Statement::TSInterfaceDeclaration(t) => {
+            types.insert(t.id.name.to_string());
+        }
+        Statement::TSEnumDeclaration(t) => {
+            types.insert(t.id.name.to_string());
+            values.insert(t.id.name.to_string(), Binding::LocalOther);
+        }
+        _ => {}
+    }
+}
+
 fn scan_stmts(stmts: &[Statement], values: &mut HashMap<String, Binding>, types: &mut HashSet<String>, depth: usize) {
     if depth > STMT_DEPTH_LIMIT {
         return;
@@ -1041,6 +1126,7 @@ struct UsageVisitor<'s> {
     module_path: &'s Path,
     specmap: &'s SpecifierMap,
     line_starts: &'s [u32],
+    unresolved_ns: &'s HashSet<String>,
     class_stack: Vec<String>,
     scopes: Vec<HashMap<String, Binding>>,
     /// Locally-declared type names (aliases, interfaces, enums, type params)
@@ -1100,6 +1186,13 @@ impl UsageVisitor<'_> {
                     .iter()
                     .any(|n| self.type_shadows.iter().any(|s| s.contains(*n)))
             });
+            // `p?: T` (no default) is `T | undefined` inside the body; a
+            // forwarded optional param must observe undefined too.
+            let ann = if p.optional && p.initializer.is_none() {
+                ann.map(|t| TypeExpr::Union(vec![t, TypeExpr::Undefined]))
+            } else {
+                ann
+            };
             match (&p.pattern, ann) {
                 (BindingPattern::BindingIdentifier(id), ann) => {
                     scope.insert(id.name.to_string(), Binding::Param { ann });
@@ -1119,6 +1212,20 @@ impl UsageVisitor<'_> {
     fn pop_fn_scope(&mut self) {
         self.scopes.pop();
         self.type_shadows.pop();
+    }
+
+    /// Push a lexical (block) scope frame. Immediate declarations are
+    /// pre-registered so use-before-decl inside the block never binds to an
+    /// outer name; the frame pops at block exit, restoring outer bindings —
+    /// block shadows must not leak (that manufactured false positives).
+    fn push_block_scope(&mut self, stmts: &[Statement]) {
+        let mut values: HashMap<String, Binding> = HashMap::new();
+        let mut types: HashSet<String> = HashSet::new();
+        for stmt in stmts {
+            scan_immediate(stmt, &mut values, &mut types);
+        }
+        self.scopes.push(values);
+        self.type_shadows.push(types);
     }
 
     /// If `obj` is provably an ARRAY (annotation is syntactically an array
@@ -1293,7 +1400,15 @@ impl UsageVisitor<'_> {
         match self.lookup(name) {
             Some(Binding::Fn) => self.escape(UsageTargetRef::Local { owner: Owner::Free, name: name.to_string() }),
             Some(Binding::Import) => self.escape(UsageTargetRef::Imported { local: name.to_string() }),
-            Some(Binding::Namespace) => self.escape(UsageTargetRef::AllExportsOfModule { ns_local: name.to_string() }),
+            Some(Binding::Namespace) => {
+                if self.unresolved_ns.contains(name) {
+                    // The value of an unresolvable namespace escapes: its
+                    // exports are unknowable, so member accesses anywhere must
+                    // taint (flag-gated MemberFreeNamed).
+                    self.untracked_namespace = true;
+                }
+                self.escape(UsageTargetRef::AllExportsOfModule { ns_local: name.to_string() });
+            }
             Some(Binding::ObjectConst) => self.escape(UsageTargetRef::AllMembersOf(Owner::ObjectConst(name.to_string()))),
             Some(Binding::Instance(cls)) => {
                 let cls = cls.clone();
@@ -1381,9 +1496,15 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
             if self.scopes.len() > 1 {
                 let is_const = it.kind == VariableDeclarationKind::Const;
                 let b = classify_declarator(it, is_const, id.name.as_str(), false, self.src, &[0], None);
-                // Strip annotations that reference locally-shadowed type names.
                 let b = match b {
+                    // Strip annotations that reference locally-shadowed type names.
                     Binding::Const { ann, lit } => Binding::Const { ann: self.safe_ann(ann), lit },
+                    // `new C()` is a tracked instance only when C is actually a
+                    // class in scope — the name alone proves nothing.
+                    Binding::Instance(cls) => match self.lookup(&cls) {
+                        Some(Binding::ClassDecl) | Some(Binding::Import) => Binding::Instance(cls),
+                        _ => Binding::LocalOther,
+                    },
                     other => other,
                 };
                 self.scope_mut().insert(id.name.to_string(), b);
@@ -1394,11 +1515,35 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
             self.scope_mut().extend(names);
         }
         if let Some(init) = &it.init {
-            // Module-level `const m = await import("./x")` is tracked as a
-            // Namespace binding; walking its init would fire the blanket
-            // AllExportsOfPath escape and destroy that precision.
-            if self.scopes.len() == 1 && dynamic_import_specifier(Some(init)).is_some() {
+            // Module-level `const m = await import("./x")` (identifier pattern
+            // only — that is what the pre-pass tracked as a Namespace binding):
+            // walking its init would fire the blanket AllExportsOfPath escape
+            // and destroy that precision. Destructured forms MUST walk so the
+            // escape fires.
+            if self.scopes.len() == 1
+                && matches!(&it.id, BindingPattern::BindingIdentifier(_))
+                && dynamic_import_specifier(Some(init)).is_some()
+            {
                 return;
+            }
+            // A tracked `const x = new C()`: the instance itself is bound, so
+            // the construction is not a value escape — walk only the args.
+            if let (BindingPattern::BindingIdentifier(id), Expression::NewExpression(n)) = (&it.id, init) {
+                if matches!(&n.callee, Expression::Identifier(_))
+                    && matches!(self.lookup(id.name.as_str()), Some(Binding::Instance(_)))
+                {
+                    for arg in &n.arguments {
+                        match arg {
+                            Argument::SpreadElement(sp) => self.visit_expression(&sp.argument),
+                            _ => {
+                                if let Some(e) = arg.as_expression() {
+                                    self.visit_expression(e);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
             }
             self.visit_expression(init);
         }
@@ -1518,6 +1663,21 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
                     self.visit_expression(&m.object);
                 }
             }
+            Expression::ComputedMemberExpression(cm) => {
+                // `obj[key](...)`: escape the owner's members when the object
+                // is tracked; a literal key also taints by method name.
+                if let Expression::Identifier(obj) = &cm.object {
+                    self.escape_identifier_use(obj.name.as_str());
+                } else {
+                    self.visit_expression(&cm.object);
+                }
+                if let Expression::StringLiteral(key) = &cm.expression {
+                    self.escape(UsageTargetRef::AnyMethodNamed(key.value.to_string()));
+                    self.escape(UsageTargetRef::MemberFreeNamed(key.value.to_string()));
+                } else {
+                    self.visit_expression(&cm.expression);
+                }
+            }
             other => self.visit_expression(other),
         }
         for (i, arg) in it.arguments.iter().enumerate() {
@@ -1536,9 +1696,20 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
     }
 
     fn visit_new_expression(&mut self, it: &NewExpression<'a>) {
-        // The class identifier in `new Cls()` is neutral.
-        if !matches!(&it.callee, Expression::Identifier(_)) {
-            self.visit_expression(&it.callee);
+        // An instance created in an untracked value position (argument, array
+        // element, return value, …) can have its methods called anywhere:
+        // escape them. Tracked `const x = new C()` declarators bypass this.
+        match &it.callee {
+            Expression::Identifier(id) => match self.lookup(id.name.as_str()) {
+                Some(Binding::ClassDecl) => {
+                    self.escape(UsageTargetRef::AllMembersOf(Owner::Class(id.name.to_string())));
+                }
+                Some(Binding::Import) => {
+                    self.escape(UsageTargetRef::Imported { local: id.name.to_string() });
+                }
+                _ => {}
+            },
+            other => self.visit_expression(other),
         }
         for arg in &it.arguments {
             match arg {
@@ -1694,6 +1865,63 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
                 JSXAttributeItem::SpreadAttribute(s) => self.visit_expression(&s.argument),
             }
         }
+    }
+
+    fn visit_block_statement(&mut self, it: &BlockStatement<'a>) {
+        self.push_block_scope(&it.body);
+        for stmt in &it.body {
+            self.visit_statement(stmt);
+        }
+        self.pop_fn_scope();
+    }
+
+    fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
+        // `for (let x of ...)` scoping: the init declarations live in a frame
+        // spanning the whole loop.
+        self.scopes.push(HashMap::new());
+        self.type_shadows.push(HashSet::new());
+        walk::walk_for_statement(self, it);
+        self.pop_fn_scope();
+    }
+
+    fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
+        self.scopes.push(HashMap::new());
+        self.type_shadows.push(HashSet::new());
+        walk::walk_for_in_statement(self, it);
+        self.pop_fn_scope();
+    }
+
+    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+        self.scopes.push(HashMap::new());
+        self.type_shadows.push(HashSet::new());
+        walk::walk_for_of_statement(self, it);
+        self.pop_fn_scope();
+    }
+
+    fn visit_switch_statement(&mut self, it: &SwitchStatement<'a>) {
+        // All cases share one lexical scope.
+        let mut values: HashMap<String, Binding> = HashMap::new();
+        let mut types: HashSet<String> = HashSet::new();
+        for case in &it.cases {
+            for stmt in &case.consequent {
+                scan_immediate(stmt, &mut values, &mut types);
+            }
+        }
+        self.scopes.push(values);
+        self.type_shadows.push(types);
+        walk::walk_switch_statement(self, it);
+        self.pop_fn_scope();
+    }
+
+    fn visit_catch_clause(&mut self, it: &CatchClause<'a>) {
+        let mut values: HashMap<String, Binding> = HashMap::new();
+        if let Some(p) = &it.param {
+            bind_pattern_names(&p.pattern, &mut values);
+        }
+        self.scopes.push(values);
+        self.type_shadows.push(HashSet::new());
+        walk::walk_catch_clause(self, it);
+        self.pop_fn_scope();
     }
 
     fn visit_class(&mut self, it: &Class<'a>) {

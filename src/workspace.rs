@@ -85,7 +85,9 @@ pub fn build(root: &Path) -> SpecifierMap {
                 if let Some(pkg_name) = read_package_name(&path) {
                     map.packages.entry(pkg_name).or_insert_with(|| dir.clone());
                 }
-            } else if name == "tsconfig.json" || name == "tsconfig.base.json" {
+            } else if name.starts_with("tsconfig") && name.ends_with(".json") {
+                // tsconfig.app.json / tsconfig.build.json etc. (Vite, NX,
+                // Angular layouts) carry paths too.
                 configs.push(path);
             }
         }
@@ -98,12 +100,14 @@ pub fn build(root: &Path) -> SpecifierMap {
 
 fn read_package_name(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim_start_matches('\u{FEFF}').to_string();
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     v.get("name")?.as_str().map(|s| s.to_string())
 }
 
 fn read_tsconfig_paths(path: &Path, map: &mut SpecifierMap) {
     let Ok(text) = std::fs::read_to_string(path) else { return };
+    let text = text.trim_start_matches('\u{FEFF}');
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(&text)) else { return };
     let dir = path.parent().unwrap_or(Path::new("."));
     let co = v.get("compilerOptions");

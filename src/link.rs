@@ -27,33 +27,116 @@ struct TargetState {
 
 enum FreeLookup {
     Found(usize),
+    /// The name resolves to a re-exported namespace object of this module.
+    FoundNamespace(ModuleId),
     /// The name definitely does not resolve to a free function we track.
     NotFound,
     /// Resolution left the analyzed universe — must taint, not drop.
     Unknown,
 }
 
-pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), String> {
+enum ClassLookup {
+    Found(ModuleId, String),
+    NotFound,
+    Unknown,
+}
+
+/// Resolve an EXPORT of module `mid` named `name` to a class declaration,
+/// following default-export indirection and re-export chains.
+fn resolve_class_export(
+    mid: ModuleId,
+    name: &str,
+    modules: &[crate::model::ModuleInfo],
+    by_path: &HashMap<PathBuf, ModuleId>,
+    visited: &mut HashSet<(ModuleId, String)>,
+) -> ClassLookup {
+    if !visited.insert((mid, name.to_string())) {
+        return ClassLookup::NotFound;
+    }
+    let effective = if name == "default" {
+        match &modules[mid].default_export {
+            Some(n) => n.clone(),
+            None => return ClassLookup::NotFound,
+        }
+    } else {
+        name.to_string()
+    };
+    if modules[mid].classes_declared.contains(&effective) {
+        return ClassLookup::Found(mid, effective);
+    }
+    if let Some((path_opt, source_name)) = modules[mid].reexports_named.get(&effective) {
+        if source_name == "*" {
+            return ClassLookup::NotFound;
+        }
+        return match path_opt {
+            Some(p) => match by_path.get(p) {
+                Some(&m2) => resolve_class_export(m2, source_name, modules, by_path, visited),
+                None => ClassLookup::Unknown,
+            },
+            None => ClassLookup::Unknown,
+        };
+    }
+    let mut unknown = false;
+    for star in &modules[mid].reexports_star {
+        match star {
+            Some(p) => match by_path.get(p) {
+                Some(&m2) => match resolve_class_export(m2, &effective, modules, by_path, visited) {
+                    ClassLookup::Found(a, b) => return ClassLookup::Found(a, b),
+                    ClassLookup::Unknown => unknown = true,
+                    ClassLookup::NotFound => {}
+                },
+                None => unknown = true,
+            },
+            None => unknown = true,
+        }
+    }
+    if unknown { ClassLookup::Unknown } else { ClassLookup::NotFound }
+}
+
+/// Resolve a class named `local` as visible in module `mid` (declaration or
+/// import), re-export-chain aware.
+fn resolve_class_via_local(
+    mid: ModuleId,
+    local: &str,
+    modules: &[crate::model::ModuleInfo],
+    by_path: &HashMap<PathBuf, ModuleId>,
+) -> ClassLookup {
+    if modules[mid].classes_declared.contains(local) {
+        return ClassLookup::Found(mid, local.to_string());
+    }
+    match modules[mid].imports.get(local) {
+        Some((Some(path), imported)) => match by_path.get(path) {
+            Some(&m2) => {
+                let mut visited = HashSet::new();
+                resolve_class_export(m2, imported, modules, by_path, &mut visited)
+            }
+            None => ClassLookup::Unknown,
+        },
+        Some((None, _)) => ClassLookup::Unknown,
+        None => ClassLookup::NotFound,
+    }
+}
+
+pub fn analyze(root: &Path, opts: &Options) -> Result<Analysis, String> {
     let root = std::fs::canonicalize(root)
         .map_err(|e| format!("cannot open {}: {e}", root.display()))?;
+    let mut warnings: Vec<String> = Vec::new();
     // Closed-world analysis is only sound over the whole repository: callers
     // outside the analysis root are invisible and would manufacture findings.
-    if !opts.quiet {
-        if let Ok(out) = std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(&root)
-            .output()
-        {
-            if out.status.success() {
-                let top = String::from_utf8_lossy(&out.stdout);
-                if let Ok(top) = std::fs::canonicalize(top.trim()) {
-                    if top != root {
-                        eprintln!(
-                            "overwide: WARNING: analyzing {} but the repository root is {} — calls outside the analyzed directory are invisible and findings may be wrong; prefer running at the repository root",
-                            root.display(),
-                            top.display()
-                        );
-                    }
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&root)
+        .output()
+    {
+        if out.status.success() {
+            let top = String::from_utf8_lossy(&out.stdout);
+            if let Ok(top) = std::fs::canonicalize(top.trim()) {
+                if top != root {
+                    warnings.push(format!(
+                        "analyzing {} but the repository root is {} — calls outside the analyzed directory are invisible and findings may be wrong; prefer running at the repository root",
+                        root.display(),
+                        top.display()
+                    ));
                 }
             }
         }
@@ -136,38 +219,38 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
         for c in m.class_extends.keys() {
             class_set.insert(ClassId(mid, c.clone()));
         }
+        for c in &m.classes_declared {
+            class_set.insert(ClassId(mid, c.clone()));
+        }
     }
     let mut parents: HashMap<ClassId, Parent> = HashMap::new();
     let mut children: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
     let mut orphans: Vec<ClassId> = Vec::new();
+    let mut classes_by_module: HashMap<ModuleId, Vec<ClassId>> = HashMap::new();
+    for c in &class_set {
+        classes_by_module.entry(c.0).or_default().push(c.clone());
+    }
     for (mid, m) in modules.iter().enumerate() {
-        for c in class_set.iter().filter(|c| c.0 == mid) {
+        let Some(mod_classes) = classes_by_module.get(&mid) else { continue };
+        for c in mod_classes {
             let parent = match m.class_extends.get(&c.1) {
                 None => Parent::None,
                 Some(sup) if sup.is_empty() => Parent::Unknown(String::new()),
                 Some(sup) => {
-                    let local = ClassId(mid, sup.clone());
-                    if class_set.contains(&local) {
-                        Parent::Known(local)
-                    } else if let Some((Some(path), imported)) = m.imports.get(sup) {
-                        match by_path.get(path) {
-                            Some(&mid2) => {
-                                let name = if imported == "default" {
-                                    modules[mid2].default_export.clone().unwrap_or_default()
-                                } else {
-                                    imported.clone()
-                                };
-                                let cid = ClassId(mid2, name);
-                                if class_set.contains(&cid) { Parent::Known(cid) } else { Parent::External }
+                    // Re-export-chain aware: `extends Base` where Base arrives
+                    // through a barrel must still produce a Known edge, and an
+                    // unresolvable chain must be Unknown (taint), never a
+                    // silent External.
+                    match resolve_class_via_local(mid, sup, &modules, &by_path) {
+                        ClassLookup::Found(m2, name) => Parent::Known(ClassId(m2, name)),
+                        ClassLookup::NotFound => {
+                            if m.imports.contains_key(sup) {
+                                Parent::External
+                            } else {
+                                Parent::Unknown(sup.clone())
                             }
-                            None => Parent::Unknown(sup.clone()),
                         }
-                    } else if m.imports.contains_key(sup) {
-                        Parent::Unknown(sup.clone())
-                    } else {
-                        // Extends something local we don't track (mixin const,
-                        // shadow): unknown.
-                        Parent::Unknown(sup.clone())
+                        ClassLookup::Unknown => Parent::Unknown(sup.clone()),
                     }
                 }
             };
@@ -180,33 +263,38 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
             parents.insert(c.clone(), parent);
         }
     }
-    // Descendants of a class: BFS over known child edges, plus every orphan
-    // (an orphan's unresolved chain could pass through anything).
-    let descendants = |start: &ClassId| -> Vec<ClassId> {
-        let mut out: Vec<ClassId> = Vec::new();
+    // Orphans (unresolvable heritage) could sit anywhere in any chain: their
+    // closure joins every descendant query. Computed once — per-query cloning
+    // was an O(#this-calls x #orphans) cliff on React-style codebases where
+    // `extends React.Component<P>` makes every class component an orphan.
+    let orphan_closure: HashSet<ClassId> = {
         let mut seen: HashSet<ClassId> = HashSet::new();
-        let mut queue: Vec<ClassId> = children.get(start).cloned().unwrap_or_default();
-        queue.extend(orphans.iter().cloned());
+        let mut queue: Vec<ClassId> = orphans.clone();
         while let Some(c) = queue.pop() {
             if !seen.insert(c.clone()) {
                 continue;
             }
             queue.extend(children.get(&c).cloned().unwrap_or_default());
-            out.push(c);
         }
-        out
+        seen
     };
+    // (home class, method name) pairs where `this.m()` was attributed; the
+    // override-escape post-pass below consumes them. Attribution counts let
+    // the post-pass exempt a decl that every same-named this-site resolves to.
+    let mut this_method_sites: HashSet<(ClassId, String)> = HashSet::new();
+    let mut this_method_attributed: HashMap<usize, usize> = HashMap::new();
+    let mut this_method_site_count: HashMap<String, usize> = HashMap::new();
     enum ChainHit {
         Found(usize),
         NotFound,
-        Tainted(Option<String>),
+        Tainted,
     }
     let find_in_chain = |start: ClassId, method: &str| -> ChainHit {
         let mut cur = start;
         let mut hops = 0;
         loop {
             if hops > 64 {
-                return ChainHit::Tainted(None);
+                return ChainHit::Tainted;
             }
             hops += 1;
             if let Some(&ti) = decl_index.get(&(cur.0, Owner::Class(cur.1.clone()), method.to_string())) {
@@ -215,7 +303,7 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
             match parents.get(&cur) {
                 Some(Parent::Known(p)) => cur = p.clone(),
                 Some(Parent::None) | Some(Parent::External) | None => return ChainHit::NotFound,
-                Some(Parent::Unknown(sup)) => return ChainHit::Tainted(Some(sup.clone())),
+                Some(Parent::Unknown(_)) => return ChainHit::Tainted,
             }
         }
     };
@@ -232,12 +320,14 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
     let untracked_namespace_exists = modules.iter().any(|m| m.has_untracked_namespace);
 
     // ---- Free-function resolution through re-export chains. ----
+    #[allow(clippy::too_many_arguments)]
     fn resolve_free(
         mid: ModuleId,
         name: &str,
         modules: &[ModuleInfo],
         by_path: &HashMap<PathBuf, ModuleId>,
         decl_index: &HashMap<(ModuleId, Owner, String), usize>,
+        flat: &[(ModuleId, usize)],
         visited: &mut HashSet<(ModuleId, String)>,
     ) -> FreeLookup {
         if !visited.insert((mid, name.to_string())) {
@@ -251,13 +341,27 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
         } else {
             name.to_string()
         };
+        // A local declaration satisfies an import only when it is exported —
+        // `export { x } from "./other"` does not bind a private local `x`.
         if let Some(&ti) = decl_index.get(&(mid, Owner::Free, effective.clone())) {
-            return FreeLookup::Found(ti);
+            let (m2, di) = flat[ti];
+            if modules[m2].decls[di].exported {
+                return FreeLookup::Found(ti);
+            }
         }
         if let Some((path_opt, source_name)) = modules[mid].reexports_named.get(&effective) {
+            if source_name == "*" {
+                return match path_opt {
+                    Some(p) => match by_path.get(p) {
+                        Some(&m2) => FreeLookup::FoundNamespace(m2),
+                        None => FreeLookup::Unknown,
+                    },
+                    None => FreeLookup::Unknown,
+                };
+            }
             return match path_opt {
                 Some(p) => match by_path.get(p) {
-                    Some(&m2) => resolve_free(m2, source_name, modules, by_path, decl_index, visited),
+                    Some(&m2) => resolve_free(m2, source_name, modules, by_path, decl_index, flat, visited),
                     None => FreeLookup::Unknown,
                 },
                 None => FreeLookup::Unknown,
@@ -267,8 +371,9 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
         for star in &modules[mid].reexports_star {
             match star {
                 Some(p) => match by_path.get(p) {
-                    Some(&m2) => match resolve_free(m2, &effective, modules, by_path, decl_index, visited) {
+                    Some(&m2) => match resolve_free(m2, &effective, modules, by_path, decl_index, flat, visited) {
                         FreeLookup::Found(ti) => return FreeLookup::Found(ti),
+                        ns @ FreeLookup::FoundNamespace(_) => return ns,
                         FreeLookup::Unknown => unknown = true,
                         FreeLookup::NotFound => {}
                     },
@@ -281,23 +386,56 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
     }
 
     // Resolve a class named `local` in module `mid` to its declaring module +
-    // class name, following one import hop (incl. default imports).
+    // class name, re-export-chain aware.
     let resolve_class_home = |mid: ModuleId, local: &str| -> Option<(ModuleId, String)> {
-        let is_local = modules[mid].decls.iter().any(|d| matches!(&d.owner, Owner::Class(c) if c == local));
-        if is_local {
-            return Some((mid, local.to_string()));
+        match resolve_class_via_local(mid, local, &modules, &by_path) {
+            ClassLookup::Found(m2, name) => Some((m2, name)),
+            _ => None,
         }
-        if let Some((Some(path), imported)) = modules[mid].imports.get(local) {
-            if let Some(&mid2) = by_path.get(path) {
-                let name = if imported == "default" {
-                    modules[mid2].default_export.clone()?
-                } else {
-                    imported.clone()
-                };
-                return Some((mid2, name));
+    };
+
+    // All exported declarations of a module (what a namespace value exposes).
+    let exported_of = |m2: ModuleId| -> Vec<usize> {
+        by_module[m2]
+            .iter()
+            .copied()
+            .filter(|&ti| {
+                let (mm, di) = flat[ti];
+                let d = &modules[mm].decls[di];
+                d.exported && !d.non_public
+            })
+            .collect()
+    };
+
+    // Everything an instance of this class exposes: its own methods plus the
+    // inherited chain; an unresolvable chain taints by the super's name.
+    let expand_class_members = |start: ClassId| -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        let mut cur = start;
+        let mut hops = 0;
+        loop {
+            if let Some(v) = by_owner.get(&(cur.0, Owner::Class(cur.1.clone()))) {
+                // private/protected methods are unreachable through an escaped
+                // class/instance value; internal this.* calls are modeled.
+                out.extend(v.iter().copied().filter(|&ti| {
+                    let (mm, di) = flat[ti];
+                    !modules[mm].decls[di].non_public
+                }));
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            match parents.get(&cur) {
+                Some(Parent::Known(p)) => cur = p.clone(),
+                Some(Parent::Unknown(sup)) => {
+                    out.extend(by_class_name.get(sup).cloned().unwrap_or_default());
+                    break;
+                }
+                _ => break,
             }
         }
-        None
+        out
     };
 
     // ---- Apply usages. ----
@@ -307,6 +445,12 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
         None,
     }
 
+    // Broad taints are idempotent; apply each once. Extraction dedupes per
+    // module, but common names (get/map/render) recur across modules, and
+    // each application cloned + filtered a full index vector.
+    let mut done_method_taint: HashSet<String> = HashSet::new();
+    let mut done_member_free_taint: HashSet<String> = HashSet::new();
+    let mut done_free_taint: HashSet<(ModuleId, String)> = HashSet::new();
     for (mid, m) in modules.iter().enumerate() {
         for u in &m.usages {
             let resolved: Resolved = match &u.target {
@@ -321,8 +465,9 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                         continue;
                     }
                     let mut visited = HashSet::new();
-                    match resolve_free(mid, name, &modules, &by_path, &decl_index, &mut visited) {
+                    match resolve_free(mid, name, &modules, &by_path, &decl_index, &flat, &mut visited) {
                         FreeLookup::Found(ti) => Resolved::One(ti),
+                        FreeLookup::FoundNamespace(m2) => Resolved::Many(exported_of(m2)),
                         // A bodyless `declare function` or similar: calls to it
                         // are calls to something we don't analyze.
                         FreeLookup::NotFound => Resolved::None,
@@ -354,17 +499,39 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                         Some(&mid2) => {
                             if imported != "default" {
                                 if let Some(&ti) = decl_index.get(&(mid2, Owner::Free, imported.clone())) {
-                                    match &u.kind {
-                                        UsageKind::Call(args) => states[ti].calls.push((mid, u.line, args.clone())),
-                                        UsageKind::Escape => states[ti].escaped = true,
+                                    // Fast path only for exported declarations:
+                                    // a private local must not satisfy an
+                                    // import (re-exports take precedence).
+                                    let (fm, fdi) = flat[ti];
+                                    if modules[fm].decls[fdi].exported {
+                                        match &u.kind {
+                                            UsageKind::Call(args) => states[ti].calls.push((mid, u.line, args.clone())),
+                                            UsageKind::Escape => states[ti].escaped = true,
+                                        }
+                                        continue;
                                     }
-                                    continue;
                                 }
                             }
                             let mut visited = HashSet::new();
-                            match resolve_free(mid2, imported, &modules, &by_path, &decl_index, &mut visited) {
+                            match resolve_free(mid2, imported, &modules, &by_path, &decl_index, &flat, &mut visited) {
                                 FreeLookup::Found(ti) => Resolved::One(ti),
-                                FreeLookup::NotFound => Resolved::None,
+                                FreeLookup::FoundNamespace(m3) => Resolved::Many(exported_of(m3)),
+                                FreeLookup::NotFound => {
+                                    // Not a free function: an imported CLASS or
+                                    // object-const used as a value must escape
+                                    // its members — dropping it manufactured
+                                    // false positives.
+                                    let mut visited2 = HashSet::new();
+                                    match resolve_class_export(mid2, imported, &modules, &by_path, &mut visited2) {
+                                        ClassLookup::Found(cm, cn) => {
+                                            Resolved::Many(expand_class_members(ClassId(cm, cn)))
+                                        }
+                                        _ => match by_owner.get(&(mid2, Owner::ObjectConst(imported.clone()))) {
+                                            Some(v) => Resolved::Many(v.clone()),
+                                            None => Resolved::None,
+                                        },
+                                    }
+                                }
                                 FreeLookup::Unknown => {
                                     Resolved::Many(by_free_name.get(imported).cloned().unwrap_or_default())
                                 }
@@ -384,8 +551,9 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                     Some((Some(path), _)) => match by_path.get(path) {
                         Some(&mid2) => {
                             let mut visited = HashSet::new();
-                            match resolve_free(mid2, name, &modules, &by_path, &decl_index, &mut visited) {
+                            match resolve_free(mid2, name, &modules, &by_path, &decl_index, &flat, &mut visited) {
                                 FreeLookup::Found(ti) => Resolved::One(ti),
+                                FreeLookup::FoundNamespace(m3) => Resolved::Many(exported_of(m3)),
                                 FreeLookup::NotFound => Resolved::None,
                                 FreeLookup::Unknown => {
                                     Resolved::Many(by_free_name.get(name).cloned().unwrap_or_default())
@@ -397,9 +565,16 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                     _ => Resolved::Many(by_free_name.get(name).cloned().unwrap_or_default()),
                 },
                 UsageTargetRef::AnyMethodNamed(name) => {
-                    Resolved::Many(by_method_name.get(name).cloned().unwrap_or_default())
+                    if done_method_taint.insert(name.clone()) {
+                        Resolved::Many(by_method_name.get(name).cloned().unwrap_or_default())
+                    } else {
+                        Resolved::None
+                    }
                 }
                 UsageTargetRef::AnyFreeNamed(name) => {
+                    if !done_free_taint.insert((mid, name.clone())) {
+                        continue;
+                    }
                     // An unbound/shadowed identifier call can only reach a
                     // function in the same module (scope-model imprecision) or
                     // in a script file (shared global scope) — never a function
@@ -421,31 +596,7 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                 }
                 UsageTargetRef::AllMembersOf(owner) => match owner {
                     Owner::Class(cls) => match resolve_class_home(mid, cls) {
-                        Some((mid2, real)) => {
-                            // Instances of this class expose its own methods
-                            // plus everything inherited up the chain.
-                            let mut out: Vec<usize> = Vec::new();
-                            let mut cur = ClassId(mid2, real.clone());
-                            let mut hops = 0;
-                            loop {
-                                if let Some(v) = by_owner.get(&(cur.0, Owner::Class(cur.1.clone()))) {
-                                    out.extend(v.iter().copied());
-                                }
-                                hops += 1;
-                                if hops > 64 {
-                                    break;
-                                }
-                                match parents.get(&cur) {
-                                    Some(Parent::Known(p)) => cur = p.clone(),
-                                    Some(Parent::Unknown(sup)) => {
-                                        out.extend(by_class_name.get(sup).cloned().unwrap_or_default());
-                                        break;
-                                    }
-                                    _ => break,
-                                }
-                            }
-                            Resolved::Many(out)
-                        }
+                        Some((mid2, real)) => Resolved::Many(expand_class_members(ClassId(mid2, real))),
                         None => Resolved::Many(by_class_name.get(cls).cloned().unwrap_or_default()),
                     },
                     _ => match by_owner.get(&(mid, owner.clone())) {
@@ -464,15 +615,13 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                                 UsageKind::Call(args) => states[ti].calls.push((mid, u.line, args.clone())),
                                 UsageKind::Escape => states[ti].escaped = true,
                             }
-                            for d in descendants(&home) {
-                                if d == home {
-                                    continue;
-                                }
-                                if let Some(&oti) = decl_index.get(&(d.0, Owner::Class(d.1.clone()), name.clone())) {
-                                    if oti != ti {
-                                        states[oti].escaped = true;
-                                    }
-                                }
+                            // Override escapes are applied in one inverted
+                            // post-pass (per method decl, walk ancestors) —
+                            // per-call descendant BFS was quadratic on deep
+                            // chains and orphan-heavy React codebases.
+                            if this_method_sites.insert((home, name.clone())) {
+                                *this_method_attributed.entry(ti).or_default() += 1;
+                                *this_method_site_count.entry(name.clone()).or_default() += 1;
                             }
                             continue;
                         }
@@ -493,7 +642,7 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                     None => Resolved::None, // external module
                 },
                 UsageTargetRef::MemberFreeNamed(name) => {
-                    if untracked_namespace_exists {
+                    if untracked_namespace_exists && done_member_free_taint.insert(name.clone()) {
                         Resolved::Many(
                             by_free_name
                                 .get(name)
@@ -514,19 +663,17 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                 }
                 UsageTargetRef::AllExportsOfModule { ns_local } => match modules[mid].imports.get(ns_local) {
                     Some((Some(path), _)) => match by_path.get(path) {
-                        Some(&mid2) => Resolved::Many(
-                            by_module[mid2]
-                                .iter()
-                                .copied()
-                                .filter(|&ti| {
-                                    let (m2, di) = flat[ti];
-                                    modules[m2].decls[di].exported
-                                })
-                                .collect(),
-                        ),
-                        None => Resolved::None, // external module: nothing analyzed to escape
+                        Some(&mid2) => Resolved::Many(exported_of(mid2)),
+                        None => Resolved::None, // resolved path outside the tree: external
                     },
-                    _ => Resolved::None,
+                    // Unresolvable module: its exports are unknowable. The
+                    // value-escape site set the untracked-namespace flag, so
+                    // member accesses on unknown objects taint same-named
+                    // exported functions project-wide (MemberFreeNamed). Calls
+                    // hidden inside ambient code remain the documented
+                    // closed-world boundary.
+                    Some((None, _)) => Resolved::None,
+                    None => Resolved::None,
                 },
             };
             match resolved {
@@ -541,6 +688,53 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                     for ti in list {
                         states[ti].escaped = true;
                     }
+                }
+            }
+        }
+    }
+
+    // ---- ThisMethod override post-pass. ----
+    // A `this.m()` in class H can dispatch to an override in any descendant of
+    // H: for every method decl, walk its ancestor chain once and escape it if
+    // some strict ancestor recorded a this-call of this name. Orphan-closure
+    // classes may descend from anything.
+    if !this_method_sites.is_empty() {
+        let override_names: HashSet<&String> = this_method_sites.iter().map(|(_, n)| n).collect();
+        for (ti, &(mid, di)) in flat.iter().enumerate() {
+            let d = &modules[mid].decls[di];
+            let Owner::Class(c) = &d.owner else { continue };
+            if !override_names.contains(&d.name) {
+                continue;
+            }
+            let home = ClassId(mid, c.clone());
+            if orphan_closure.contains(&home) {
+                // An orphan could descend from any chain — escape, UNLESS every
+                // same-named this-site attributes to this very decl (then it is
+                // the receiver, not an override of some other chain).
+                let attributed = this_method_attributed.get(&ti).copied().unwrap_or(0);
+                let total = this_method_site_count.get(&d.name).copied().unwrap_or(0);
+                if attributed < total {
+                    states[ti].escaped = true;
+                }
+                continue;
+            }
+            let mut cur = home;
+            let mut hops = 0;
+            loop {
+                match parents.get(&cur) {
+                    Some(Parent::Known(p)) => {
+                        if this_method_sites.contains(&(p.clone(), d.name.clone())) {
+                            states[ti].escaped = true;
+                            break;
+                        }
+                        cur = p.clone();
+                    }
+                    _ => break,
+                }
+                hops += 1;
+                if hops > 64 {
+                    states[ti].escaped = true;
+                    break;
                 }
             }
         }
@@ -612,8 +806,8 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                         function_name: d.name.clone(),
                         param: param.name.clone(),
                         path: report.path,
-                        declared: report.declared,
-                        unused: report.unused,
+                        declared: display_ty(&report.declared),
+                        unused: report.unused.iter().map(|u| display_ty(u)).collect(),
                         call_count: st.calls.len(),
                         sites: sites.clone(),
                     });
@@ -637,6 +831,7 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
         read_error_files,
         ..Default::default()
     };
+    let mut uncalled: Vec<UncalledFn> = Vec::new();
     for (ti, &(mid, di)) in flat.iter().enumerate() {
         let d = &modules[mid].decls[di];
         match d.skip {
@@ -649,11 +844,30 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                     stats.escaped += 1;
                 } else if states[ti].calls.is_empty() {
                     stats.uncalled += 1;
+                    uncalled.push(UncalledFn {
+                        file: modules[mid].rel.clone(),
+                        line: d.line,
+                        function_name: d.name.clone(),
+                        exported: d.exported,
+                    });
                 } else {
                     stats.analyzed += 1;
                 }
             }
         }
+    }
+    uncalled.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    if stats.parse_error_files > 0 {
+        warnings.push(format!(
+            "{} file(s) had parse errors — their call sites may be missing and findings may be unreliable",
+            stats.parse_error_files
+        ));
+    }
+    if stats.read_error_files > 0 {
+        warnings.push(format!(
+            "{} file(s) could not be read (non-UTF8?) — treated as empty",
+            stats.read_error_files
+        ));
     }
 
     if opts.timing {
@@ -664,7 +878,7 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
             t0.elapsed()
         );
     }
-    Ok((findings, stats))
+    Ok(Analysis { findings, stats, uncalled, warnings })
 }
 
 /// Collect analyzable files. Accepts a directory or a single file. Symlinks
@@ -703,4 +917,27 @@ fn collect_files(root: &Path) -> Result<(Vec<PathBuf>, PathBuf), String> {
     }
     out.sort();
     Ok((out, root.to_path_buf()))
+}
+
+/// Collapse whitespace and cap length so a 30-line interface body or a
+/// 3000-constituent union doesn't render a finding unreadable.
+fn display_ty(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(160));
+    let mut last_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_ws {
+                out.push(' ');
+            }
+            last_ws = true;
+        } else {
+            out.push(ch);
+            last_ws = false;
+        }
+        if out.len() > 156 {
+            out.push('…');
+            break;
+        }
+    }
+    out
 }

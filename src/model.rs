@@ -2,7 +2,7 @@
 //! parser arena, so extraction can run in parallel and ASTs are dropped
 //! immediately after their file is processed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 pub type ModuleId = usize;
@@ -100,6 +100,10 @@ pub struct FnDecl {
     pub line: u32,
     pub end_line: u32,
     pub exported: bool,
+    /// private/protected class method: unreachable from outside the class
+    /// hierarchy, so class-value escapes don't affect it (only `this.*` calls
+    /// and name-based taints can).
+    pub non_public: bool,
     /// Why this declaration cannot be analyzed, if it can't.
     pub skip: Option<SkipReason>,
     /// Convenience: `skip.is_none()`.
@@ -181,8 +185,8 @@ pub struct ModuleInfo {
     pub rel: String,
     pub decls: Vec<FnDecl>,
     pub type_aliases: HashMap<String, TypeExpr>,
-    /// Enum name -> member names in declaration order.
-    pub enums: HashMap<String, Vec<String>>,
+    /// Enum name -> (member name, is_string_member) in declaration order.
+    pub enums: HashMap<String, Vec<(String, bool)>>,
     /// Local binding name -> (source module if resolved, imported name).
     /// Namespace imports use "*" as the imported name; default imports use "default".
     pub imports: HashMap<String, ImportEntry>,
@@ -205,6 +209,12 @@ pub struct ModuleInfo {
     /// or a dynamic import/require whose literal specifier didn't resolve.
     /// Activates the project-wide MemberFreeNamed taints.
     pub has_untracked_namespace: bool,
+    /// Every class declared in this module (methodless ones included), so the
+    /// inheritance graph has complete nodes.
+    pub classes_declared: HashSet<String>,
+    /// Names exported via source-less specifiers: (local, exported) pairs, so
+    /// `import { x } from ...; export { x as y }` becomes a re-export edge.
+    pub export_specifiers: Vec<(String, String)>,
     /// Class name -> local name of its `extends` base (identifier heritage
     /// only). Classes extending expressions are recorded with "" (unknown
     /// parent — treated as a potential descendant of anything).
@@ -251,6 +261,28 @@ impl Default for Options {
             quiet: false,
         }
     }
+}
+
+/// An eligible, un-escaped function with zero visible direct calls — a
+/// dead-function candidate under the closed-world assumption.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UncalledFn {
+    pub file: String,
+    pub line: u32,
+    #[serde(rename = "function")]
+    pub function_name: String,
+    pub exported: bool,
+}
+
+/// Complete result of a run: what --json emits (plus version).
+#[derive(Debug, Clone)]
+pub struct Analysis {
+    pub findings: Vec<Finding>,
+    pub stats: Stats,
+    pub uncalled: Vec<UncalledFn>,
+    /// Soundness-relevant warnings (parse errors, unreadable files, sub-root
+    /// analysis). Printed even under --quiet.
+    pub warnings: Vec<String>,
 }
 
 /// Run statistics surfaced to stderr so silent degradation is visible.

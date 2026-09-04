@@ -37,6 +37,8 @@
     { "file": "src/29-callbacks.tsx", "function": "handle", "param": "c", "path": "", "unused": ["\"c\""] },
     { "file": "src/29-callbacks.tsx", "function": "handle2", "param": "c", "path": "", "unused": ["\"c\""] },
     { "file": "src/29-callbacks.tsx", "function": "withIdx", "param": "c", "path": "", "unused": ["\"y\""] },
-    { "file": "src/29-callbacks.tsx", "function": "onPress", "param": "mode", "path": "", "unused": ["\"fast\"", "\"slow\""] }
+    { "file": "src/29-callbacks.tsx", "function": "onPress", "param": "mode", "path": "", "unused": ["\"fast\"", "\"slow\""] },
+    { "file": "src/30-barrel2-def.ts", "function": "relay2", "param": "c", "path": "", "unused": ["\"z\""] },
+    { "file": "src/31-optional-forward.ts", "function": "outer31", "param": "y", "path": "", "unused": ["\"q\""] }
   ]
 }

@@ -31,7 +31,7 @@ fn fixture_matches_expected() {
     let expected: Expected =
         serde_json::from_str(&std::fs::read_to_string(root.join("expected.json")).unwrap()).unwrap();
 
-    let (findings, _stats) = overwide::analyze(&root, &overwide::Options::default()).unwrap();
+    let findings = overwide::analyze(&root, &overwide::Options::default()).unwrap().findings;
 
     let got: BTreeSet<String> = findings
         .iter()
@@ -57,7 +57,7 @@ fn fixture_matches_expected() {
 fn respect_exports_drops_exported() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixture");
     let opts = overwide::Options { respect_exports: true, ..Default::default() };
-    let (findings, _stats) = overwide::analyze(&root, &opts).unwrap();
+    let findings = overwide::analyze(&root, &opts).unwrap().findings;
     // 06-cross-file-def.ts `log` is exported and must disappear in open-world mode.
     assert!(
         !findings.iter().any(|f| f.file.contains("06-cross-file-def")),

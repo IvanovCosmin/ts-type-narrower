@@ -86,7 +86,26 @@ fn walk(
                         lit_index.entry(c).or_default().push(i);
                         bool_lits.push(i);
                     }
-                    Ty::EnumLit { .. } | Ty::Undefined | Ty::Null => {
+                    Ty::EnumLit { is_string, .. } => {
+                        lit_index.entry(c).or_default().push(i);
+                        // Enum members are subtypes of string/number: a
+                        // string/number observation subsumes them.
+                        if *is_string {
+                            str_lits.push(i);
+                        } else {
+                            num_lits.push(i);
+                        }
+                    }
+                    Ty::Undefined | Ty::Null => {
+                        lit_index.entry(c).or_default().push(i);
+                    }
+                    // any/unknown constituents are matched by every
+                    // observation; unions are collapsed at resolve time, but
+                    // guard here for directly-constructed unions.
+                    Ty::AnyLike => {
+                        prim_str.push(i);
+                        prim_num.push(i);
+                        prim_bool.push(i);
                         lit_index.entry(c).or_default().push(i);
                     }
                     Ty::Str => prim_str.push(i),
@@ -103,7 +122,7 @@ fn walk(
                         continue;
                     }
                     let mut any = false;
-                    let mut mark = |idx: &[usize], used: &mut Vec<bool>, any: &mut bool| {
+                    let mark = |idx: &[usize], used: &mut Vec<bool>, any: &mut bool| {
                         for &i in idx {
                             used[i] = true;
                             *any = true;
@@ -120,6 +139,8 @@ fn walk(
                                 Ty::StrLit(_) => mark(&prim_str, &mut used, &mut any),
                                 Ty::NumLit(_) => mark(&prim_num, &mut used, &mut any),
                                 Ty::BoolLit(_) => mark(&prim_bool, &mut used, &mut any),
+                                Ty::EnumLit { is_string: true, .. } => mark(&prim_str, &mut used, &mut any),
+                                Ty::EnumLit { is_string: false, .. } => mark(&prim_num, &mut used, &mut any),
                                 _ => {}
                             }
                         }
@@ -236,7 +257,10 @@ fn assignable_at(a: &Ty, b: &Ty, depth: usize) -> bool {
         (Ty::BoolLit(_), Ty::Bool) => true,
         (Ty::Str, Ty::Str) | (Ty::Num, Ty::Num) | (Ty::Bool, Ty::Bool) => true,
         (Ty::Undefined, Ty::Undefined) | (Ty::Null, Ty::Null) => true,
-        (Ty::EnumLit { enum_name: e1, member: m1 }, Ty::EnumLit { enum_name: e2, member: m2 }) => e1 == e2 && m1 == m2,
+        (Ty::EnumLit { enum_name: e1, member: m1, .. }, Ty::EnumLit { enum_name: e2, member: m2, .. }) => {
+            e1 == e2 && m1 == m2
+        }
+        (Ty::EnumLit { is_string: true, .. }, Ty::Str) | (Ty::EnumLit { is_string: false, .. }, Ty::Num) => true,
         (Ty::Arr(a), Ty::Arr(b)) => assignable_at(a, b, depth + 1),
         (Ty::Object(ap), Ty::Object(bp)) => bp.iter().all(|need| match ap.iter().find(|x| x.name == need.name) {
             Some(have) => assignable_at(&have.ty, &need.ty, depth + 1),
