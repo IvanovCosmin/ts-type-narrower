@@ -1,0 +1,28 @@
+{
+  "comment": "Ground truth for the fixture project, default settings (closed world). Findings are keyed by file/function/param/path. 'unused' entries are checker.typeToString of each never-passed union constituent.",
+  "findings": [
+    { "file": "src/01-basic.ts", "function": "send", "param": "channel", "path": "", "unused": ["\"fax\""] },
+    { "file": "src/02-typed-vars.ts", "function": "sendA", "param": "channel", "path": "", "unused": ["\"push\"", "\"fax\""] },
+    { "file": "src/03-partial-union.ts", "function": "send", "param": "channel", "path": "", "unused": ["\"push\"", "\"fax\""] },
+    { "file": "src/04-discriminated.ts", "function": "process", "param": "request", "path": "", "unused": ["{ type: \"admin\"; token: string; }"] },
+    { "file": "src/05-nested.ts", "function": "configure", "param": "config", "path": ".mode", "unused": ["\"test\""] },
+    { "file": "src/05-nested.ts", "function": "configure", "param": "config", "path": ".opts.level", "unused": ["3"] },
+    { "file": "src/05-nested.ts", "function": "configure", "param": "config", "path": ".opts.log.format", "unused": ["\"syslog\""] },
+    { "file": "src/05-nested.ts", "function": "configure", "param": "config", "path": ".opts.log.color", "unused": ["false"] },
+    { "file": "src/06-cross-file-def.ts", "function": "log", "param": "verbosity", "path": "", "unused": ["\"trace\""] },
+    { "file": "src/11-methods.ts", "function": "write", "param": "level", "path": "", "unused": ["\"error\"", "\"fatal\""] },
+    { "file": "src/11-methods.ts", "function": "emit", "param": "level", "path": "", "unused": ["\"info\"", "\"warn\"", "\"fatal\""] },
+    { "file": "src/12-arrow.ts", "function": "send", "param": "channel", "path": "", "unused": ["\"sms\"", "\"push\""] },
+    { "file": "src/13-enums.ts", "function": "schedule", "param": "priority", "path": "", "unused": ["Priority.High", "Priority.Critical"] },
+    { "file": "src/14-optional-default.ts", "function": "run", "param": "mode", "path": "", "unused": ["\"slow\"", "\"adaptive\""] },
+    { "file": "src/14-optional-default.ts", "function": "walk", "param": "mode", "path": "", "unused": ["\"adaptive\""] },
+    { "file": "src/14-optional-default.ts", "function": "toggle", "param": "enabled", "path": "", "unused": ["false"] },
+    { "file": "src/15-jsx.tsx", "function": "Badge", "param": "props", "path": ".variant", "unused": ["\"error\"", "\"neutral\""] },
+    { "file": "src/15-jsx.tsx", "function": "Badge", "param": "props", "path": ".size", "unused": ["\"md\"", "\"lg\""] },
+    { "file": "src/16-deep-nesting.ts", "function": "drill", "param": "deep", "path": ".l1.l2.l3.l4.leaf", "unused": ["{ kind: \"c\"; c: boolean; }"] },
+    { "file": "src/16-deep-nesting.ts", "function": "drill", "param": "deep", "path": ".l1.l2.l3.l4.tag", "unused": ["\"z\""] },
+    { "file": "src/17-multi-param.ts", "function": "request", "param": "method", "path": "", "unused": ["\"PUT\"", "\"DELETE\""] },
+    { "file": "src/17-multi-param.ts", "function": "request", "param": "encoding", "path": "", "unused": ["\"form\"", "\"binary\""] },
+    { "file": "src/17-multi-param.ts", "function": "request", "param": "retries", "path": "", "unused": ["1", "5"] }
+  ]
+}

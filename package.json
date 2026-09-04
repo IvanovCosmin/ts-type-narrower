@@ -1,0 +1,21 @@
+{
+  "name": "overwide",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Detects function parameters whose declared union types are wider than what call sites actually pass.",
+  "bin": {
+    "overwide": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/",
+    "bench:gen": "npm run build && node dist/bench/generate.js",
+    "bench": "npm run build && node dist/bench/run.js"
+  },
+  "dependencies": {
+    "typescript": "^5.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}
