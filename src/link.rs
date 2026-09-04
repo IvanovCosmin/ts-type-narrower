@@ -113,6 +113,113 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
     }
     let mut states: Vec<TargetState> = flat.iter().map(|_| TargetState { calls: Vec::new(), escaped: false }).collect();
 
+    // ---- Class inheritance graph. ----
+    #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+    struct ClassId(ModuleId, String);
+    #[derive(Clone, Debug)]
+    enum Parent {
+        None,
+        Known(ClassId),
+        /// Chain leaves the analyzed universe cleanly (external base class).
+        External,
+        /// Unresolvable heritage (aliased import, expression): carries the
+        /// local super name for name-based tainting.
+        Unknown(String),
+    }
+    let mut class_set: HashSet<ClassId> = HashSet::new();
+    for (mid, m) in modules.iter().enumerate() {
+        for d in &m.decls {
+            if let Owner::Class(c) = &d.owner {
+                class_set.insert(ClassId(mid, c.clone()));
+            }
+        }
+        for c in m.class_extends.keys() {
+            class_set.insert(ClassId(mid, c.clone()));
+        }
+    }
+    let mut parents: HashMap<ClassId, Parent> = HashMap::new();
+    let mut children: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
+    let mut orphans: Vec<ClassId> = Vec::new();
+    for (mid, m) in modules.iter().enumerate() {
+        for c in class_set.iter().filter(|c| c.0 == mid) {
+            let parent = match m.class_extends.get(&c.1) {
+                None => Parent::None,
+                Some(sup) if sup.is_empty() => Parent::Unknown(String::new()),
+                Some(sup) => {
+                    let local = ClassId(mid, sup.clone());
+                    if class_set.contains(&local) {
+                        Parent::Known(local)
+                    } else if let Some((Some(path), imported)) = m.imports.get(sup) {
+                        match by_path.get(path) {
+                            Some(&mid2) => {
+                                let name = if imported == "default" {
+                                    modules[mid2].default_export.clone().unwrap_or_default()
+                                } else {
+                                    imported.clone()
+                                };
+                                let cid = ClassId(mid2, name);
+                                if class_set.contains(&cid) { Parent::Known(cid) } else { Parent::External }
+                            }
+                            None => Parent::Unknown(sup.clone()),
+                        }
+                    } else if m.imports.contains_key(sup) {
+                        Parent::Unknown(sup.clone())
+                    } else {
+                        // Extends something local we don't track (mixin const,
+                        // shadow): unknown.
+                        Parent::Unknown(sup.clone())
+                    }
+                }
+            };
+            if let Parent::Known(p) = &parent {
+                children.entry(p.clone()).or_default().push(c.clone());
+            }
+            if matches!(parent, Parent::Unknown(_)) {
+                orphans.push(c.clone());
+            }
+            parents.insert(c.clone(), parent);
+        }
+    }
+    // Descendants of a class: BFS over known child edges, plus every orphan
+    // (an orphan's unresolved chain could pass through anything).
+    let descendants = |start: &ClassId| -> Vec<ClassId> {
+        let mut out: Vec<ClassId> = Vec::new();
+        let mut seen: HashSet<ClassId> = HashSet::new();
+        let mut queue: Vec<ClassId> = children.get(start).cloned().unwrap_or_default();
+        queue.extend(orphans.iter().cloned());
+        while let Some(c) = queue.pop() {
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            queue.extend(children.get(&c).cloned().unwrap_or_default());
+            out.push(c);
+        }
+        out
+    };
+    enum ChainHit {
+        Found(usize),
+        NotFound,
+        Tainted(Option<String>),
+    }
+    let find_in_chain = |start: ClassId, method: &str| -> ChainHit {
+        let mut cur = start;
+        let mut hops = 0;
+        loop {
+            if hops > 64 {
+                return ChainHit::Tainted(None);
+            }
+            hops += 1;
+            if let Some(&ti) = decl_index.get(&(cur.0, Owner::Class(cur.1.clone()), method.to_string())) {
+                return ChainHit::Found(ti);
+            }
+            match parents.get(&cur) {
+                Some(Parent::Known(p)) => cur = p.clone(),
+                Some(Parent::None) | Some(Parent::External) | None => return ChainHit::NotFound,
+                Some(Parent::Unknown(sup)) => return ChainHit::Tainted(Some(sup.clone())),
+            }
+        }
+    };
+
     // Any file we could not fully read/parse may hide call sites: taint every
     // name it could have called — we don't know them, so taint globally is the
     // only sound choice; we instead surface it loudly and keep analyzing,
@@ -120,6 +227,9 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
     // documented soundness trade-off.
     let parse_error_files = modules.iter().filter(|m| m.parse_errors > 0).count();
     let read_error_files = modules.iter().filter(|m| m.read_error).count();
+    // When any module created a namespace value we could not track, member
+    // accesses on unknown objects must taint same-named exported functions.
+    let untracked_namespace_exists = modules.iter().any(|m| m.has_untracked_namespace);
 
     // ---- Free-function resolution through re-export chains. ----
     fn resolve_free(
@@ -225,14 +335,12 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                     // Method on a tracked object/class.
                     match owner {
                         Owner::Class(cls) => match resolve_class_home(mid, cls) {
-                            Some((mid2, real)) => {
-                                match decl_index.get(&(mid2, Owner::Class(real), name.clone())) {
-                                    Some(&ti) => Resolved::One(ti),
-                                    // Inherited/unknown method (e.g. subclass
-                                    // instance): taint by method name.
-                                    None => Resolved::Many(by_method_name.get(name).cloned().unwrap_or_default()),
-                                }
-                            }
+                            // `new Cls()` binds the exact class: resolve the
+                            // method through the inheritance chain.
+                            Some((mid2, real)) => match find_in_chain(ClassId(mid2, real), name) {
+                                ChainHit::Found(ti) => Resolved::One(ti),
+                                _ => Resolved::Many(by_method_name.get(name).cloned().unwrap_or_default()),
+                            },
                             None => Resolved::Many(by_method_name.get(name).cloned().unwrap_or_default()),
                         },
                         _ => match decl_index.get(&(mid, owner.clone(), name.clone())) {
@@ -292,14 +400,52 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                     Resolved::Many(by_method_name.get(name).cloned().unwrap_or_default())
                 }
                 UsageTargetRef::AnyFreeNamed(name) => {
-                    Resolved::Many(by_free_name.get(name).cloned().unwrap_or_default())
+                    // An unbound/shadowed identifier call can only reach a
+                    // function in the same module (scope-model imprecision) or
+                    // in a script file (shared global scope) — never a function
+                    // module-scoped elsewhere.
+                    Resolved::Many(
+                        by_free_name
+                            .get(name)
+                            .map(|v| {
+                                v.iter()
+                                    .copied()
+                                    .filter(|&ti| {
+                                        let (m2, _) = flat[ti];
+                                        m2 == mid || !modules[m2].is_module
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    )
                 }
                 UsageTargetRef::AllMembersOf(owner) => match owner {
                     Owner::Class(cls) => match resolve_class_home(mid, cls) {
-                        Some((mid2, real)) => match by_owner.get(&(mid2, Owner::Class(real.clone()))) {
-                            Some(v) => Resolved::Many(v.clone()),
-                            None => Resolved::Many(by_class_name.get(&real).cloned().unwrap_or_default()),
-                        },
+                        Some((mid2, real)) => {
+                            // Instances of this class expose its own methods
+                            // plus everything inherited up the chain.
+                            let mut out: Vec<usize> = Vec::new();
+                            let mut cur = ClassId(mid2, real.clone());
+                            let mut hops = 0;
+                            loop {
+                                if let Some(v) = by_owner.get(&(cur.0, Owner::Class(cur.1.clone()))) {
+                                    out.extend(v.iter().copied());
+                                }
+                                hops += 1;
+                                if hops > 64 {
+                                    break;
+                                }
+                                match parents.get(&cur) {
+                                    Some(Parent::Known(p)) => cur = p.clone(),
+                                    Some(Parent::Unknown(sup)) => {
+                                        out.extend(by_class_name.get(sup).cloned().unwrap_or_default());
+                                        break;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            Resolved::Many(out)
+                        }
                         None => Resolved::Many(by_class_name.get(cls).cloned().unwrap_or_default()),
                     },
                     _ => match by_owner.get(&(mid, owner.clone())) {
@@ -307,6 +453,65 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                         None => Resolved::None,
                     },
                 },
+                UsageTargetRef::ThisMethod { class, name } => {
+                    // `this.m(...)` in `class`: attribute up the chain, and
+                    // escape overrides in descendant classes (the receiver may
+                    // be a subclass instance).
+                    let home = ClassId(mid, class.clone());
+                    match find_in_chain(home.clone(), name) {
+                        ChainHit::Found(ti) => {
+                            match &u.kind {
+                                UsageKind::Call(args) => states[ti].calls.push((mid, u.line, args.clone())),
+                                UsageKind::Escape => states[ti].escaped = true,
+                            }
+                            for d in descendants(&home) {
+                                if d == home {
+                                    continue;
+                                }
+                                if let Some(&oti) = decl_index.get(&(d.0, Owner::Class(d.1.clone()), name.clone())) {
+                                    if oti != ti {
+                                        states[oti].escaped = true;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        _ => Resolved::Many(by_method_name.get(name).cloned().unwrap_or_default()),
+                    }
+                }
+                UsageTargetRef::AllExportsOfPath(path) => match by_path.get(path) {
+                    Some(&mid2) => Resolved::Many(
+                        by_module[mid2]
+                            .iter()
+                            .copied()
+                            .filter(|&ti| {
+                                let (m2, di) = flat[ti];
+                                modules[m2].decls[di].exported
+                            })
+                            .collect(),
+                    ),
+                    None => Resolved::None, // external module
+                },
+                UsageTargetRef::MemberFreeNamed(name) => {
+                    if untracked_namespace_exists {
+                        Resolved::Many(
+                            by_free_name
+                                .get(name)
+                                .map(|v| {
+                                    v.iter()
+                                        .copied()
+                                        .filter(|&ti| {
+                                            let (m2, di) = flat[ti];
+                                            modules[m2].decls[di].exported
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        )
+                    } else {
+                        Resolved::None
+                    }
+                }
                 UsageTargetRef::AllExportsOfModule { ns_local } => match modules[mid].imports.get(ns_local) {
                     Some((Some(path), _)) => match by_path.get(path) {
                         Some(&mid2) => Resolved::Many(

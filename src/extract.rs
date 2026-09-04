@@ -100,14 +100,19 @@ pub fn extract_module(path: &Path, rel: String, source: &str, specmap: &Specifie
     // ---- Usage pass. ----
     let mut v = UsageVisitor {
         src: source,
+        module_path: path,
+        specmap,
         line_starts: &line_starts,
+        class_stack: Vec::new(),
         scopes: vec![module_scope],
         type_shadows: vec![HashSet::new()],
         usages: Vec::new(),
         emitted_escapes: HashSet::new(),
+        untracked_namespace: false,
     };
     v.visit_program(&ret.program);
     info.usages = v.usages;
+    info.has_untracked_namespace = v.untracked_namespace;
     info
 }
 
@@ -222,6 +227,7 @@ fn prepass_stmt(
 ) {
     match stmt {
         Statement::ImportDeclaration(d) => {
+            info.is_module = true;
             let Some(specs) = &d.specifiers else { return };
             let source_path = resolve_import(path, d.source.value.as_str(), specmap);
             for s in specs {
@@ -246,6 +252,7 @@ fn prepass_stmt(
             }
         }
         Statement::ExportNamedDeclaration(d) => {
+            info.is_module = true;
             if let Some(source) = &d.source {
                 // Re-export: `export { a as b } from "./m"`.
                 let source_path = resolve_import(path, source.value.as_str(), specmap);
@@ -264,6 +271,7 @@ fn prepass_stmt(
             }
         }
         Statement::ExportAllDeclaration(d) => {
+            info.is_module = true;
             // `export * as ns from ...` re-exports a namespace object; we model
             // it as an unresolvable star so misses taint instead of vanishing.
             if d.exported.is_some() {
@@ -272,7 +280,9 @@ fn prepass_stmt(
                 info.reexports_star.push(resolve_import(path, d.source.value.as_str(), specmap));
             }
         }
-        Statement::ExportDefaultDeclaration(d) => match &d.declaration {
+        Statement::ExportDefaultDeclaration(d) => {
+            info.is_module = true;
+            match &d.declaration {
             ExportDefaultDeclarationKind::Identifier(id) => {
                 info.default_export = Some(id.name.to_string());
                 exported.insert(id.name.to_string());
@@ -290,7 +300,8 @@ fn prepass_stmt(
                 }
             }
             _ => {}
-        },
+            }
+        }
         Statement::VariableDeclaration(v) => prepass_var(v, false, src, path, specmap, line_starts, info, scope),
         Statement::FunctionDeclaration(f) => prepass_function(f, false, src, line_starts, info, scope, bodyless_fns),
         Statement::ClassDeclaration(c) => prepass_class(c, false, src, line_starts, info, scope),
@@ -416,6 +427,16 @@ fn prepass_class(
     let Some(id) = &c.id else { return };
     let class_name = id.name.to_string();
     scope.insert(class_name.clone(), Binding::ClassDecl);
+    match &c.super_class {
+        Some(Expression::Identifier(sup)) => {
+            info.class_extends.insert(class_name.clone(), sup.name.to_string());
+        }
+        Some(_) => {
+            // Unknown heritage: potential descendant of anything.
+            info.class_extends.insert(class_name.clone(), String::new());
+        }
+        None => {}
+    }
     // Inheritance is unmodeled: a subclass can expose this class's methods
     // under its own name (see link-time AnyMethodNamed handling); a class that
     // *extends* something also inherits methods we can't see. Mark methods of
@@ -588,19 +609,43 @@ fn classify_declarator(
     }
 }
 
-/// `import("./x")` or `await import("./x")` with a literal specifier.
+/// `import("./x")`, `await import("./x")`, or `require("./x")` with a
+/// literal specifier — all produce a module-namespace value.
 fn dynamic_import_specifier(init: Option<&Expression>) -> Option<String> {
     let e = init?;
     let inner = match e {
         Expression::AwaitExpression(a) => &a.argument,
         other => other,
     };
-    if let Expression::ImportExpression(imp) = inner {
-        if let Expression::StringLiteral(s) = &imp.source {
-            return Some(s.value.to_string());
+    match inner {
+        Expression::ImportExpression(imp) => {
+            if let Expression::StringLiteral(s) = &imp.source {
+                return Some(s.value.to_string());
+            }
+            None
         }
+        Expression::CallExpression(c) => {
+            if let Expression::Identifier(id) = &c.callee {
+                if id.name == "require" && c.arguments.len() == 1 {
+                    if let Some(Expression::StringLiteral(s)) = c.arguments[0].as_expression() {
+                        return Some(s.value.to_string());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    None
+}
+
+fn call_string_arg(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 1 {
+        return None;
+    }
+    match call.arguments[0].as_expression() {
+        Some(Expression::StringLiteral(s)) => Some(s.value.to_string()),
+        _ => None,
+    }
 }
 
 fn simple_literal(e: &Expression) -> Option<Observed> {
@@ -962,7 +1007,10 @@ fn bind_pattern_names(p: &BindingPattern, scope: &mut HashMap<String, Binding>) 
 
 struct UsageVisitor<'s> {
     src: &'s str,
+    module_path: &'s Path,
+    specmap: &'s SpecifierMap,
     line_starts: &'s [u32],
+    class_stack: Vec<String>,
     scopes: Vec<HashMap<String, Binding>>,
     /// Locally-declared type names (aliases, interfaces, enums, type params)
     /// per scope: any annotation mentioning one resolves to Opaque, since our
@@ -970,6 +1018,7 @@ struct UsageVisitor<'s> {
     type_shadows: Vec<HashSet<String>>,
     usages: Vec<Usage>,
     emitted_escapes: HashSet<(u8, String)>,
+    untracked_namespace: bool,
 }
 
 impl UsageVisitor<'_> {
@@ -1143,6 +1192,9 @@ impl UsageVisitor<'_> {
             UsageTargetRef::AnyFreeNamed(n) => (4, n.clone()),
             UsageTargetRef::AllMembersOf(o) => (5, format!("{o:?}")),
             UsageTargetRef::AllExportsOfModule { ns_local } => (6, ns_local.clone()),
+            UsageTargetRef::AllExportsOfPath(p) => (7, format!("{p:?}")),
+            UsageTargetRef::ThisMethod { class, name } => (8, format!("{class}|{name}")),
+            UsageTargetRef::MemberFreeNamed(n) => (9, n.clone()),
         };
         if self.emitted_escapes.insert(key) {
             self.usages.push(Usage { target, kind: UsageKind::Escape, line: 0 });
@@ -1255,6 +1307,12 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
             self.scope_mut().extend(names);
         }
         if let Some(init) = &it.init {
+            // Module-level `const m = await import("./x")` is tracked as a
+            // Namespace binding; walking its init would fire the blanket
+            // AllExportsOfPath escape and destroy that precision.
+            if self.scopes.len() == 1 && dynamic_import_specifier(Some(init)).is_some() {
+                return;
+            }
             self.visit_expression(init);
         }
     }
@@ -1270,14 +1328,31 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
                     self.escape(UsageTargetRef::AllExportsOfModule { ns_local: id.name.to_string() });
                 }
                 _ => {
+                    // `require("./x")` produces a namespace value wherever it
+                    // appears: escape that module's exports at the source.
+                    if id.name == "require" {
+                        match call_string_arg(it).map(|spec| resolve_import(self.module_path, &spec, self.specmap)) {
+                            Some(Some(p)) => self.escape(UsageTargetRef::AllExportsOfPath(p)),
+                            _ => self.untracked_namespace = true,
+                        }
+                    }
                     // Unattributable identifier call (shadowed, unbound, or a
-                    // plain value): could reach any same-named free function.
+                    // plain value): could reach a same-named free function in
+                    // this module or in a script file (shared global scope).
                     self.escape(UsageTargetRef::AnyFreeNamed(id.name.to_string()));
                 }
             },
             Expression::StaticMemberExpression(m) => {
                 let prop = m.property.name.to_string();
-                if let Expression::Identifier(obj) = &m.object {
+                if matches!(&m.object, Expression::ThisExpression(_)) {
+                    if let Some(cls) = self.class_stack.last() {
+                        let cls = cls.clone();
+                        self.record_call(UsageTargetRef::ThisMethod { class: cls, name: prop }, it);
+                    } else {
+                        // `this` in an object-literal method or free function.
+                        self.escape(UsageTargetRef::AnyMethodNamed(prop));
+                    }
+                } else if let Expression::Identifier(obj) = &m.object {
                     match self.lookup(obj.name.as_str()) {
                         Some(Binding::ObjectConst) => {
                             let owner = Owner::ObjectConst(obj.name.to_string());
@@ -1300,17 +1375,17 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
                             self.escape(UsageTargetRef::AnyMethodNamed(prop));
                         }
                         _ => {
-                            // Unattributable method call: could hit any method
-                            // with this name, or a free function reached via an
-                            // untracked namespace-like object (dynamic import,
-                            // required module, …).
+                            // Unattributable method call. Tracked namespace
+                            // values escape at their source, so free functions
+                            // need only the conditional taint (active when an
+                            // untracked namespace exists anywhere).
                             self.escape(UsageTargetRef::AnyMethodNamed(prop.clone()));
-                            self.escape(UsageTargetRef::AnyFreeNamed(prop));
+                            self.escape(UsageTargetRef::MemberFreeNamed(prop));
                         }
                     }
                 } else {
                     self.escape(UsageTargetRef::AnyMethodNamed(prop.clone()));
-                    self.escape(UsageTargetRef::AnyFreeNamed(prop));
+                    self.escape(UsageTargetRef::MemberFreeNamed(prop));
                     self.visit_expression(&m.object);
                 }
             }
@@ -1361,14 +1436,16 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
                     self.escape(UsageTargetRef::Local { owner: Owner::Class(cls), name: prop });
                 }
                 Some(Binding::EnumDecl) => {}
+                // A property read yields a value; tracked functions stored
+                // behind properties escaped at their store/pass sites.
                 _ => {
                     self.escape(UsageTargetRef::AnyMethodNamed(prop.clone()));
-                    self.escape(UsageTargetRef::AnyFreeNamed(prop));
+                    self.escape(UsageTargetRef::MemberFreeNamed(prop));
                 }
             }
         } else {
             self.escape(UsageTargetRef::AnyMethodNamed(prop.clone()));
-            self.escape(UsageTargetRef::AnyFreeNamed(prop));
+            self.escape(UsageTargetRef::MemberFreeNamed(prop));
             self.visit_expression(&it.object);
         }
     }
@@ -1450,6 +1527,50 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
                 }
                 JSXAttributeItem::SpreadAttribute(s) => self.visit_expression(&s.argument),
             }
+        }
+    }
+
+    fn visit_class(&mut self, it: &Class<'a>) {
+        // Identifier heritage is tracked in the class graph (link phase), so
+        // the `extends Base` reference itself is neutral; expression heritage
+        // is walked (and the class is an orphan in the graph).
+        match &it.super_class {
+            Some(Expression::Identifier(_)) | None => {}
+            Some(other) => self.visit_expression(other),
+        }
+        let name = it.id.as_ref().map(|id| id.name.to_string());
+        if let Some(n) = &name {
+            if self.scopes.len() > 1 {
+                self.scope_mut().insert(n.clone(), Binding::LocalOther);
+            }
+            self.class_stack.push(n.clone());
+        }
+        self.visit_class_body(&it.body);
+        if name.is_some() {
+            self.class_stack.pop();
+        }
+    }
+
+    fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
+        // A dynamic import expression materializes a namespace value in an
+        // arbitrary position: the target module's exports escape here (the
+        // tracked `const m = await import(...)` declarator form suppresses
+        // this walk and stays precise). Computed or unresolvable specifiers
+        // activate the project-wide MemberFreeNamed taints instead.
+        match &it.source {
+            Expression::StringLiteral(s) => {
+                match resolve_import(self.module_path, s.value.as_str(), self.specmap) {
+                    Some(p) => self.escape(UsageTargetRef::AllExportsOfPath(p)),
+                    None => self.untracked_namespace = true,
+                }
+            }
+            other => {
+                self.untracked_namespace = true;
+                self.visit_expression(other);
+            }
+        }
+        if let Some(opts) = &it.options {
+            self.visit_expression(opts);
         }
     }
 

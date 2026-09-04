@@ -138,6 +138,20 @@ pub enum UsageTargetRef {
     /// A namespace-import binding escaped as a value: everything the source
     /// module exports must be considered escaped.
     AllExportsOfModule { ns_local: String },
+    /// A module-namespace VALUE was created in an untracked position
+    /// (`import("./x")` / `require("./x")` flowing somewhere): everything that
+    /// module exports escapes.
+    AllExportsOfPath(PathBuf),
+    /// Member access on an object we cannot attribute. Escapes same-named
+    /// exported free functions, but ONLY when some module in the project
+    /// created a namespace value we could not track (computed or unresolvable
+    /// dynamic import) — otherwise every namespace value is tracked at its
+    /// source and this taint is vacuous.
+    MemberFreeNamed(String),
+    /// `this.m(...)` inside a class body: a call to the method resolved
+    /// through the inheritance chain, plus escapes for overrides in
+    /// descendant classes (the receiver may be a subclass instance).
+    ThisMethod { class: String, name: String },
 }
 
 #[derive(Debug)]
@@ -176,6 +190,18 @@ pub struct ModuleInfo {
     /// File could not be read as UTF-8 (treated as empty — a soundness hazard
     /// that must at least be surfaced).
     pub read_error: bool,
+    /// True when the file contains any import/export syntax. Script files
+    /// (false) share the global scope, so unbound identifier calls anywhere
+    /// can reach their functions.
+    pub is_module: bool,
+    /// A namespace value escaped tracking here: computed `import(expr)`,
+    /// or a dynamic import/require whose literal specifier didn't resolve.
+    /// Activates the project-wide MemberFreeNamed taints.
+    pub has_untracked_namespace: bool,
+    /// Class name -> local name of its `extends` base (identifier heritage
+    /// only). Classes extending expressions are recorded with "" (unknown
+    /// parent — treated as a potential descendant of anything).
+    pub class_extends: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

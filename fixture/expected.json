@@ -31,6 +31,8 @@
     { "file": "src/26-destructured.tsx", "function": "Chip", "param": "{tone, size}", "path": ".tone", "unused": ["\"t3\""] },
     { "file": "src/26-destructured.tsx", "function": "Chip", "param": "{tone, size}", "path": ".size", "unused": ["\"m\"", "\"l\""] },
     { "file": "src/26-destructured.tsx", "function": "pinner", "param": "t", "path": "", "unused": ["\"p3\""] },
-    { "file": "src/26-destructured.tsx", "function": "qinner", "param": "lv", "path": "", "unused": ["9"] }
+    { "file": "src/26-destructured.tsx", "function": "qinner", "param": "lv", "path": "", "unused": ["9"] },
+    { "file": "src/27-classes.ts", "function": "speak", "param": "v", "path": "", "unused": ["\"high\""] },
+    { "file": "src/28-global-def.ts", "function": "isNaN", "param": "x", "path": "", "unused": ["\"b\""] }
   ]
 }
