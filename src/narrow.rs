@@ -237,6 +237,7 @@ fn assignable_at(a: &Ty, b: &Ty, depth: usize) -> bool {
         (Ty::Str, Ty::Str) | (Ty::Num, Ty::Num) | (Ty::Bool, Ty::Bool) => true,
         (Ty::Undefined, Ty::Undefined) | (Ty::Null, Ty::Null) => true,
         (Ty::EnumLit { enum_name: e1, member: m1 }, Ty::EnumLit { enum_name: e2, member: m2 }) => e1 == e2 && m1 == m2,
+        (Ty::Arr(a), Ty::Arr(b)) => assignable_at(a, b, depth + 1),
         (Ty::Object(ap), Ty::Object(bp)) => bp.iter().all(|need| match ap.iter().find(|x| x.name == need.name) {
             Some(have) => assignable_at(&have.ty, &need.ty, depth + 1),
             None => need.optional,

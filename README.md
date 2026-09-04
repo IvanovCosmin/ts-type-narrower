@@ -99,9 +99,20 @@ function, so block-scoped shadowing degrades to escapes/opaque observations
 rather than wrong bindings; annotations mentioning function-local type
 declarations resolve to opaque.
 
+Functions passed as callbacks are modeled instead of escaped in two cases
+where the invocation contract is statically known: array higher-order methods
+(`map`, `forEach`, `filter`, `find`, `some`, `every`, `flatMap`, `sort`, …)
+when the receiver is provably an array (an `E[]`/`Array<E>` annotation, an
+array literal, or an `as const`/`as E[]` cast) — the callback observes
+(element, index, array); and JSX intrinsic-element handlers
+(`<button onClick={h}/>`), which the DOM/JSX runtime invokes with exactly one
+event argument, so trailing optional parameters are provably never provided.
+Callbacks passed to user methods, component props, or `addEventListener`
+still escape — those receivers can call with anything.
+
 Known limits (all degrade to under-reporting, never over-reporting): unions
-are terminal (no per-variant recursion), arrays/tuples/generics/intersections
-are opaque, class components and `this.method()` escape broadly, symlinked
+are terminal (no per-variant recursion), tuples/generics/intersections
+are opaque (array types are modeled), class components and `this.method()` escape broadly, symlinked
 directories are skipped, and files with parse errors or non-UTF8 content are
 analyzed partially with a loud stderr warning (their missing call sites are
 the one place the guarantee is knowingly best-effort).
@@ -112,7 +123,7 @@ the one place the guarantee is knowingly best-effort).
   `workspace.rs` (tsconfig paths + workspace package names), `link.rs`
   (cross-module linking + taints + orchestration), `resolve.rs` (memoized type
   resolution), `narrow.rs` (the narrowing core), `diff.rs`, `genproj.rs`.
-- `fixture/` — a handcrafted TypeScript project with 26 cases (including
+- `fixture/` — a handcrafted TypeScript project with 29 cases (including
   regression cases for barrel files, default/namespace imports, shadowing,
   local type shadowing, subsumed constituents, dotted filenames, JSX member
   tags) and ground truth in `fixture/expected.json`; `npm run check:fixture`

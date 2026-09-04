@@ -24,6 +24,7 @@ pub enum Ty {
     EnumLit { enum_name: String, member: String },
     Union(Vec<Ty>),
     Object(Vec<RProp>),
+    Arr(Box<Ty>),
     /// Unmodeled type; never matches anything.
     Opaque(String),
 }
@@ -89,6 +90,7 @@ impl<'m> Resolver<'m> {
             TypeExpr::Undefined => Ty::Undefined,
             TypeExpr::Null => Ty::Null,
             TypeExpr::Any | TypeExpr::Unknown => Ty::AnyLike,
+            TypeExpr::Arr(e) => Ty::Arr(Box::new(self.resolve_inner(e, mid, stack))),
             TypeExpr::Proj(base, prop) => {
                 let base = self.resolve_inner(base, mid, stack);
                 project(&base, prop)
@@ -214,6 +216,10 @@ impl<'m> Resolver<'m> {
                 }
                 Ty::AnyLike
             }
+            Observed::ElemOf(base) => {
+                let base = self.resolve_expr(base, mid);
+                project_elem(&base)
+            }
             Observed::Object(props) => Ty::Object(
                 props
                     .iter()
@@ -222,6 +228,28 @@ impl<'m> Resolver<'m> {
             ),
             Observed::Opaque => Ty::AnyLike,
         }
+    }
+}
+
+/// The element type of an array. Observed-only: unresolvable cases fall back
+/// to AnyLike (covers everything).
+fn project_elem(base: &Ty) -> Ty {
+    match base {
+        Ty::Arr(e) => (**e).clone(),
+        Ty::Union(parts) => {
+            let mut out: Vec<Ty> = Vec::new();
+            for part in parts {
+                match project_elem(part) {
+                    Ty::AnyLike => return Ty::AnyLike,
+                    Ty::Union(inner) => out.extend(inner),
+                    t => out.push(t),
+                }
+            }
+            dedupe(&mut out);
+            Ty::Union(out)
+        }
+        Ty::AnyLike => Ty::AnyLike,
+        _ => Ty::AnyLike,
     }
 }
 
@@ -292,6 +320,10 @@ pub fn print_ty(t: &Ty) -> String {
             s.push('}');
             s
         }
+        Ty::Arr(e) => match &**e {
+            Ty::Union(_) => format!("({})[]", print_ty(e)),
+            _ => format!("{}[]", print_ty(e)),
+        },
         Ty::Opaque(s) => s.clone(),
     }
 }

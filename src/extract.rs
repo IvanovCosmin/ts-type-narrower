@@ -638,6 +638,26 @@ fn dynamic_import_specifier(init: Option<&Expression>) -> Option<String> {
     }
 }
 
+/// Convert a literal observation into the equivalent type expression, for
+/// array-literal receivers. Values are exactly these, so this is precise.
+fn observed_to_type(obs: &Observed) -> Option<TypeExpr> {
+    match obs {
+        Observed::StrLit(s) => Some(TypeExpr::StrLit(s.clone())),
+        Observed::NumLit(n) => Some(TypeExpr::NumLit(n.clone())),
+        Observed::BoolLit(b) => Some(TypeExpr::BoolLit(*b)),
+        Observed::Undefined => Some(TypeExpr::Undefined),
+        Observed::Null => Some(TypeExpr::Null),
+        Observed::Object(props) => {
+            let mut out = Vec::new();
+            for (name, o) in props {
+                out.push(ObjProp { name: name.clone(), ty: observed_to_type(o)?, optional: false });
+            }
+            Some(TypeExpr::ObjectLit(out))
+        }
+        _ => None,
+    }
+}
+
 fn call_string_arg(call: &CallExpression) -> Option<String> {
     if call.arguments.len() != 1 {
         return None;
@@ -800,8 +820,18 @@ pub fn ts_type_to_expr(t: &TSType, src: &str, depth: usize) -> TypeExpr {
             TSLiteral::BooleanLiteral(b) => TypeExpr::BoolLit(b.value),
             _ => TypeExpr::Opaque(span_text(src, l.span).to_string()),
         },
+        TSType::TSArrayType(a) => TypeExpr::Arr(Box::new(ts_type_to_expr(&a.element_type, src, depth + 1))),
+        TSType::TSTypeOperatorType(op) => {
+            // `readonly E[]` — readonly-ness is irrelevant to value analysis.
+            ts_type_to_expr(&op.type_annotation, src, depth + 1)
+        }
         TSType::TSTypeReference(r) => {
-            if r.type_arguments.is_some() {
+            if let Some(args) = &r.type_arguments {
+                if let TSTypeName::IdentifierReference(id) = &r.type_name {
+                    if (id.name == "Array" || id.name == "ReadonlyArray") && args.params.len() == 1 {
+                        return TypeExpr::Arr(Box::new(ts_type_to_expr(&args.params[0], src, depth + 1)));
+                    }
+                }
                 return TypeExpr::Opaque(span_text(src, r.span).to_string());
             }
             match &r.type_name {
@@ -829,6 +859,7 @@ fn collect_refs<'a>(te: &'a TypeExpr, out: &mut Vec<&'a str>) {
         TypeExpr::Union(parts) => parts.iter().for_each(|p| collect_refs(p, out)),
         TypeExpr::ObjectLit(props) => props.iter().for_each(|p| collect_refs(&p.ty, out)),
         TypeExpr::Proj(base, _) => collect_refs(base, out),
+        TypeExpr::Arr(e) => collect_refs(e, out),
         _ => {}
     }
 }
@@ -1090,6 +1121,62 @@ impl UsageVisitor<'_> {
         self.type_shadows.pop();
     }
 
+    /// If `obj` is provably an ARRAY (annotation is syntactically an array
+    /// type, or an array literal of literals), return its array TypeExpr.
+    /// Anything else returns None and the callback stays an escape — a user
+    /// type with a `.map` method could store the callback.
+    fn array_receiver_elem(&self, obj: &Expression) -> Option<TypeExpr> {
+        match obj {
+            Expression::Identifier(id) => match self.lookup(id.name.as_str()) {
+                Some(Binding::Param { ann: Some(t) }) | Some(Binding::Const { ann: Some(t), .. }) => {
+                    if self.type_shadowed(t) {
+                        return None;
+                    }
+                    match t {
+                        TypeExpr::Arr(_) => Some(t.clone()),
+                        TypeExpr::Union(parts) if parts.iter().all(|p| matches!(p, TypeExpr::Arr(_))) => {
+                            Some(t.clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            Expression::ArrayExpression(a) => {
+                let mut parts: Vec<TypeExpr> = Vec::new();
+                for el in &a.elements {
+                    let e = el.as_expression()?;
+                    let obs = literal_observed(e, 0)?;
+                    parts.push(observed_to_type(&obs)?);
+                }
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(TypeExpr::Arr(Box::new(TypeExpr::Union(parts))))
+                }
+            }
+            Expression::TSAsExpression(x) => {
+                if let TSType::TSTypeReference(r) = &x.type_annotation {
+                    if let TSTypeName::IdentifierReference(id) = &r.type_name {
+                        if id.name == "const" {
+                            return self.array_receiver_elem(&x.expression);
+                        }
+                    }
+                }
+                let t = ts_type_to_expr(&x.type_annotation, self.src, 0);
+                if self.type_shadowed(&t) {
+                    return None;
+                }
+                match t {
+                    TypeExpr::Arr(_) => Some(t),
+                    _ => None,
+                }
+            }
+            Expression::ParenthesizedExpression(p) => self.array_receiver_elem(&p.expression),
+            _ => None,
+        }
+    }
+
     fn expr_to_observed(&self, e: &Expression, depth: usize) -> Observed {
         if depth > TYPE_DEPTH_LIMIT {
             return Observed::Opaque;
@@ -1318,6 +1405,48 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
     }
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        // Array higher-order methods with a statically-known element type:
+        // the builtin's contract bounds every callback invocation, so a
+        // tracked function passed as the callback becomes a modeled call
+        // (element, index, array) instead of an escape.
+        let mut consumed_arg: Option<usize> = None;
+        if let Expression::StaticMemberExpression(m) = &it.callee {
+            if let Some(elem) = self.array_receiver_elem(&m.object) {
+                let method = m.property.name.as_str();
+                let is_elem_cb = matches!(
+                    method,
+                    "map" | "forEach" | "filter" | "find" | "findIndex" | "findLast" | "findLastIndex"
+                        | "some" | "every" | "flatMap"
+                );
+                let is_sort = method == "sort";
+                if (is_elem_cb || is_sort) && !it.arguments.is_empty() {
+                    if let Some(Expression::Identifier(cb)) = it.arguments[0].as_expression() {
+                        let target = match self.lookup(cb.name.as_str()) {
+                            Some(Binding::Fn) => {
+                                Some(UsageTargetRef::Local { owner: Owner::Free, name: cb.name.to_string() })
+                            }
+                            Some(Binding::Import) => Some(UsageTargetRef::Imported { local: cb.name.to_string() }),
+                            _ => None,
+                        };
+                        if let Some(target) = target {
+                            let elem_obs = Observed::ElemOf(Box::new(elem.clone()));
+                            let args = if is_sort {
+                                vec![elem_obs.clone(), elem_obs]
+                            } else {
+                                vec![elem_obs, Observed::Typed(TypeExpr::Num), Observed::Typed(elem.clone())]
+                            };
+                            let line = line_of(self.line_starts, it.span.start);
+                            self.usages.push(Usage {
+                                target,
+                                kind: UsageKind::Call(CallArgs::Args(args)),
+                                line,
+                            });
+                            consumed_arg = Some(0);
+                        }
+                    }
+                }
+            }
+        }
         match &it.callee {
             Expression::Identifier(id) => match self.lookup(id.name.as_str()) {
                 Some(Binding::Fn) => self.record_call(UsageTargetRef::Local { owner: Owner::Free, name: id.name.to_string() }, it),
@@ -1391,7 +1520,10 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
             }
             other => self.visit_expression(other),
         }
-        for arg in &it.arguments {
+        for (i, arg) in it.arguments.iter().enumerate() {
+            if consumed_arg == Some(i) {
+                continue;
+            }
             match arg {
                 Argument::SpreadElement(s) => self.visit_expression(&s.argument),
                 _ => {
@@ -1451,6 +1583,7 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
     }
 
     fn visit_jsx_opening_element(&mut self, it: &JSXOpeningElement<'a>) {
+        let mut consumed_attrs: HashSet<usize> = HashSet::new();
         match &it.name {
             JSXElementName::IdentifierReference(id) => {
                 let target = match self.lookup(id.name.as_str()) {
@@ -1493,6 +1626,36 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
                     self.usages.push(Usage { target, kind: UsageKind::Call(args), line });
                 }
             }
+            JSXElementName::Identifier(_) => {
+                // Intrinsic element (<button/>): on[A-Z]* handler props follow
+                // the DOM/JSX-runtime contract — invoked with exactly one
+                // (opaque) event argument — so a tracked function there is a
+                // modeled call, not an escape.
+                for (i, attr) in it.attributes.iter().enumerate() {
+                    let JSXAttributeItem::Attribute(a) = attr else { continue };
+                    let JSXAttributeName::Identifier(name) = &a.name else { continue };
+                    let n = name.name.as_str();
+                    if !(n.len() > 2 && n.starts_with("on") && n.as_bytes()[2].is_ascii_uppercase()) {
+                        continue;
+                    }
+                    let Some(JSXAttributeValue::ExpressionContainer(c)) = &a.value else { continue };
+                    let Some(Expression::Identifier(h)) = c.expression.as_expression() else { continue };
+                    let target = match self.lookup(h.name.as_str()) {
+                        Some(Binding::Fn) => Some(UsageTargetRef::Local { owner: Owner::Free, name: h.name.to_string() }),
+                        Some(Binding::Import) => Some(UsageTargetRef::Imported { local: h.name.to_string() }),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        let line = line_of(self.line_starts, a.span.start);
+                        self.usages.push(Usage {
+                            target,
+                            kind: UsageKind::Call(CallArgs::Args(vec![Observed::Opaque])),
+                            line,
+                        });
+                        consumed_attrs.insert(i);
+                    }
+                }
+            }
             JSXElementName::MemberExpression(m) => {
                 // <UI.Badge .../>: unattributable component reference — escape
                 // by member name, and escape the base object if we track it.
@@ -1516,7 +1679,10 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
             _ => {}
         }
         // Walk attribute values for nested usages; the tag name is consumed.
-        for attr in &it.attributes {
+        for (i, attr) in it.attributes.iter().enumerate() {
+            if consumed_attrs.contains(&i) {
+                continue;
+            }
             match attr {
                 JSXAttributeItem::Attribute(a) => {
                     if let Some(JSXAttributeValue::ExpressionContainer(c)) = &a.value {

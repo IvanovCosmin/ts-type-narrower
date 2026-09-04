@@ -23,6 +23,8 @@ pub enum TypeExpr {
     Any,
     Unknown,
     ObjectLit(Vec<ObjProp>),
+    /// Array type: `E[]`, `Array<E>`, `ReadonlyArray<E>`, `readonly E[]`.
+    Arr(Box<TypeExpr>),
     /// Property projection: the type of `base[prop]`, used for destructured
     /// parameter bindings (`{ variant }: BadgeProps` binds `variant` to
     /// `Proj(BadgeProps, "variant")`). Only ever feeds OBSERVED types — its
@@ -54,6 +56,11 @@ pub enum Observed {
     /// Enum member access like `Priority.Low`.
     EnumMember { enum_name: String, member: String },
     Object(Vec<(String, Observed)>),
+    /// The element type of an array-typed receiver: what an array-method
+    /// callback (`arr.map(cb)`) observes as its first argument. Resolves wide
+    /// (AnyLike) whenever the base isn't provably an array — observed-only,
+    /// like Proj.
+    ElemOf(Box<TypeExpr>),
     /// Cannot determine — covers everything.
     Opaque,
 }
