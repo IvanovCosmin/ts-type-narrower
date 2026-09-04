@@ -23,6 +23,10 @@
     { "file": "src/16-deep-nesting.ts", "function": "drill", "param": "deep", "path": ".l1.l2.l3.l4.tag", "unused": ["\"z\""] },
     { "file": "src/17-multi-param.ts", "function": "request", "param": "method", "path": "", "unused": ["\"PUT\"", "\"DELETE\""] },
     { "file": "src/17-multi-param.ts", "function": "request", "param": "encoding", "path": "", "unused": ["\"form\"", "\"binary\""] },
-    { "file": "src/17-multi-param.ts", "function": "request", "param": "retries", "path": "", "unused": ["1", "5"] }
+    { "file": "src/17-multi-param.ts", "function": "request", "param": "retries", "path": "", "unused": ["1", "5"] },
+    { "file": "src/19-barrel-def.ts", "function": "relay", "param": "c", "path": "", "unused": ["\"r3\""] },
+    { "file": "src/20-default-def.ts", "function": "dflt", "param": "m", "path": "", "unused": ["\"d2\"", "\"d3\""] },
+    { "file": "src/20-ns-def.ts", "function": "nsfn", "param": "m", "path": "", "unused": ["\"n3\""] },
+    { "file": "src/24-dotted.service.ts", "function": "dsend", "param": "c", "path": "", "unused": ["\"s3\""] }
   ]
 }

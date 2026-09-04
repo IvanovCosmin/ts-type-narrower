@@ -97,24 +97,44 @@ pub enum UsageKind {
     Escape,
 }
 
-/// How a usage names its target; resolved during linking.
+/// How a usage names its target; resolved during linking. Every variant that
+/// cannot be resolved MUST degrade to escapes of every plausible target —
+/// never to silence — or the soundness guarantee breaks.
 #[derive(Debug)]
 pub enum UsageTargetRef {
     Local { owner: Owner, name: String },
-    Imported { local: String, name: String },
+    /// Through a named or default import; `local` is the binding name in the
+    /// using module, resolved via `ModuleInfo::imports`.
+    Imported { local: String },
+    /// `ns.f(...)` through `import * as ns`.
+    NamespaceMember { ns_local: String, name: String },
     /// `obj.m(...)` or `obj.m` where `obj` could not be resolved:
     /// conservatively hits every method named `m` in the project.
     AnyMethodNamed(String),
+    /// An identifier call whose callee binding could not be attributed
+    /// (shadowed, unbound, or a plain value): conservatively escapes every
+    /// same-named free function that this call could reach.
+    AnyFreeNamed(String),
     /// A tracked object/class binding escaped as a value: every method of that
     /// owner must be considered escaped.
     AllMembersOf(Owner),
+    /// A namespace-import binding escaped as a value: everything the source
+    /// module exports must be considered escaped.
+    AllExportsOfModule { ns_local: String },
 }
 
 #[derive(Debug)]
 pub struct Usage {
     pub target: UsageTargetRef,
     pub kind: UsageKind,
+    /// 1-based line of the call site (0 for escapes).
+    pub line: u32,
 }
+
+/// Where an import specifier points. `path: None` means the module could not
+/// be resolved (external package, unknown alias) — users of the binding must
+/// then taint by name, never be dropped.
+pub type ImportEntry = (Option<PathBuf>, String);
 
 #[derive(Debug, Default)]
 pub struct ModuleInfo {
@@ -125,10 +145,20 @@ pub struct ModuleInfo {
     pub type_aliases: HashMap<String, TypeExpr>,
     /// Enum name -> member names in declaration order.
     pub enums: HashMap<String, Vec<String>>,
-    /// Local binding name -> (resolved absolute path of source module, imported name).
-    pub imports: HashMap<String, (PathBuf, String)>,
+    /// Local binding name -> (source module if resolved, imported name).
+    /// Namespace imports use "*" as the imported name; default imports use "default".
+    pub imports: HashMap<String, ImportEntry>,
+    /// `export { x as y } from "./m"`: exported name -> (source module, source name).
+    pub reexports_named: HashMap<String, ImportEntry>,
+    /// `export * from "./m"`: None entries mean an unresolvable source.
+    pub reexports_star: Vec<Option<PathBuf>>,
+    /// Name of the declaration exported as `export default`, if identifiable.
+    pub default_export: Option<String>,
     pub usages: Vec<Usage>,
     pub parse_errors: usize,
+    /// File could not be read as UTF-8 (treated as empty — a soundness hazard
+    /// that must at least be surfaced).
+    pub read_error: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -143,6 +173,8 @@ pub struct Finding {
     pub unused: Vec<String>,
     #[serde(rename = "callCount")]
     pub call_count: usize,
+    /// Up to three example call sites ("file:line") as evidence.
+    pub sites: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,10 +184,31 @@ pub struct Options {
     pub respect_exports: bool,
     pub max_depth: usize,
     pub timing: bool,
+    pub fail_on_findings: bool,
+    /// Suppress the stderr summary line.
+    pub quiet: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { diff_base: None, json: false, respect_exports: false, max_depth: 6, timing: false }
+        Self {
+            diff_base: None,
+            json: false,
+            respect_exports: false,
+            max_depth: 6,
+            timing: false,
+            fail_on_findings: false,
+            quiet: false,
+        }
     }
+}
+
+/// Run statistics surfaced to stderr so silent degradation is visible.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct Stats {
+    pub files: usize,
+    pub decls: usize,
+    pub analyzed: usize,
+    pub parse_error_files: usize,
+    pub read_error_files: usize,
 }

@@ -9,7 +9,7 @@ pub type ChangedLines = HashMap<PathBuf, Vec<(u32, u32)>>;
 
 pub fn git_changed_lines(base: &str, cwd: &Path) -> Result<ChangedLines, String> {
     let root = run_git(cwd, &["rev-parse", "--show-toplevel"])?;
-    let root = PathBuf::from(root.trim());
+    let root = std::fs::canonicalize(root.trim()).map_err(|e| format!("git toplevel: {e}"))?;
     let out = run_git(
         cwd,
         &["diff", "-U0", "--no-color", base, "--", "*.ts", "*.tsx", "*.mts", "*.cts"],
@@ -31,26 +31,76 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Hunk headers on the new-file side. Pure deletions (`+n,0`) still produce a
 /// one-line range so a function that only lost lines counts as modified.
+///
+/// A `+++ ` line is only a header when the previous line was a `--- ` header —
+/// with `-U0`, an added source line like `++ x;` renders as `+++ x;` and must
+/// not be mistaken for one. Git C-quotes non-ASCII paths (`"b/caf\303\251.ts"`);
+/// those are unquoted.
 pub fn parse_unified_diff(diff: &str, git_root: &Path) -> ChangedLines {
     let mut result: ChangedLines = HashMap::new();
     let mut current: Option<PathBuf> = None;
+    let mut prev_was_minus_header = false;
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let p = rest.trim();
+        if prev_was_minus_header && line.starts_with("+++ ") {
+            let p = unquote_git_path(line[4..].trim());
             current = if p == "/dev/null" {
                 None
             } else {
-                Some(git_root.join(p.strip_prefix("b/").unwrap_or(p)))
+                Some(git_root.join(p.strip_prefix("b/").unwrap_or(&p)))
             };
-        } else if let Some(file) = &current {
-            if let Some(rest) = line.strip_prefix("@@") {
-                if let Some(range) = parse_hunk_new_side(rest) {
+        } else if line.starts_with("@@") {
+            if let Some(file) = &current {
+                if let Some(range) = parse_hunk_new_side(&line[2..]) {
                     result.entry(file.clone()).or_default().push(range);
                 }
             }
         }
+        prev_was_minus_header = line.starts_with("--- ");
     }
     result
+}
+
+/// Undo git's C-style quoting: `"b/caf\303\251.ts"` -> `b/café.ts`.
+fn unquote_git_path(p: &str) -> String {
+    if !(p.starts_with('"') && p.ends_with('"') && p.len() >= 2) {
+        return p.to_string();
+    }
+    let inner = &p[1..p.len() - 1];
+    let bytes = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let c = bytes[i + 1];
+            match c {
+                b'n' => {
+                    out.push(b'\n');
+                    i += 2;
+                }
+                b't' => {
+                    out.push(b'\t');
+                    i += 2;
+                }
+                b'\\' | b'"' => {
+                    out.push(c);
+                    i += 2;
+                }
+                b'0'..=b'7' if i + 3 < bytes.len() && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b)) => {
+                    let v = (bytes[i + 1] - b'0') * 64 + (bytes[i + 2] - b'0') * 8 + (bytes[i + 3] - b'0');
+                    out.push(v);
+                    i += 4;
+                }
+                _ => {
+                    out.push(c);
+                    i += 2;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn parse_hunk_new_side(header: &str) -> Option<(u32, u32)> {

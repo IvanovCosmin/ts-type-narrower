@@ -7,15 +7,19 @@ const USAGE: &str = "\
 overwide — find function parameters declared wider than any call site uses
 
 USAGE:
-  overwide <dir> [--diff <base>] [--json] [--respect-exports] [--max-depth N] [--timing]
+  overwide <dir|file> [OPTIONS]
   overwide gen --out <dir> [--files N] [--fns N] [--seed N]
 
 OPTIONS:
-  --diff <base>       Only report functions touched by `git diff <base>`
-  --json              JSON output
-  --respect-exports   Skip exported functions (open-world; default is closed-world)
-  --max-depth N       Property recursion depth (default 6)
-  --timing            Phase timings on stderr
+  --diff <base>        Only report functions touched by `git diff <base>`.
+                       In CI prefer merge-base form: --diff 'origin/main...HEAD'
+  --json               JSON output
+  --respect-exports    Skip exported functions (open-world; default is closed-world)
+  --max-depth N        Property recursion depth (default 6)
+  --fail-on-findings   Exit 1 when findings exist (for CI gating)
+  --quiet              Suppress the stderr summary line
+  --timing             Phase timings on stderr
+  --version            Print version
 ";
 
 fn main() -> ExitCode {
@@ -24,12 +28,16 @@ fn main() -> ExitCode {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     }
+    if args[0] == "--version" || args[0] == "-V" {
+        println!("overwide {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     if args[0] == "gen" {
         return match overwide_gen(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
-                ExitCode::FAILURE
+                ExitCode::from(2)
             }
         };
     }
@@ -41,7 +49,13 @@ fn main() -> ExitCode {
         match args[i].as_str() {
             "--diff" => {
                 i += 1;
-                opts.diff_base = Some(args.get(i).cloned().unwrap_or_default());
+                match args.get(i) {
+                    Some(v) if !v.starts_with('-') => opts.diff_base = Some(v.clone()),
+                    _ => {
+                        eprintln!("--diff requires a git base ref\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
             }
             "--json" => opts.json = true,
             "--respect-exports" => opts.respect_exports = true,
@@ -49,6 +63,8 @@ fn main() -> ExitCode {
                 i += 1;
                 opts.max_depth = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(6);
             }
+            "--fail-on-findings" => opts.fail_on_findings = true,
+            "--quiet" => opts.quiet = true,
             "--timing" => opts.timing = true,
             other => {
                 eprintln!("unknown option: {other}\n{USAGE}");
@@ -59,7 +75,7 @@ fn main() -> ExitCode {
     }
 
     match analyze(&root, &opts) {
-        Ok(findings) => {
+        Ok((findings, stats)) => {
             if opts.json {
                 println!("{}", serde_json::to_string_pretty(&findings).unwrap());
             } else if findings.is_empty() {
@@ -73,20 +89,47 @@ fn main() -> ExitCode {
                         format!("{}({}){}", f.function_name, f.param, f.path)
                     };
                     println!(
-                        "{loc}  {subject}: declared {}, never passed: {}  [{} call{}]",
+                        "{loc}  {subject}: declared {}, never passed: {}  [{} call{}: {}{}]",
                         f.declared,
                         f.unused.join(", "),
                         f.call_count,
-                        if f.call_count == 1 { "" } else { "s" }
+                        if f.call_count == 1 { "" } else { "s" },
+                        f.sites.join(", "),
+                        if f.call_count > f.sites.len() { ", …" } else { "" },
                     );
                 }
                 println!("\n{} finding(s)", findings.len());
+            }
+            if !opts.quiet {
+                let mut summary = format!(
+                    "overwide: {} files, {} functions ({} analyzed), {} finding(s)",
+                    stats.files,
+                    stats.decls,
+                    stats.analyzed,
+                    findings.len()
+                );
+                if stats.parse_error_files > 0 {
+                    summary.push_str(&format!(
+                        "; WARNING: {} file(s) had parse errors — their call sites may be missing",
+                        stats.parse_error_files
+                    ));
+                }
+                if stats.read_error_files > 0 {
+                    summary.push_str(&format!(
+                        "; WARNING: {} file(s) could not be read (non-UTF8?) — treated as empty",
+                        stats.read_error_files
+                    ));
+                }
+                eprintln!("{summary}");
+            }
+            if opts.fail_on_findings && !findings.is_empty() {
+                return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("error: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(2)
         }
     }
 }

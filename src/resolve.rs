@@ -1,12 +1,15 @@
 //! Resolution of extracted `TypeExpr` / `Observed` values into semantic types
 //! (`Ty`), following aliases, interfaces, enums, and imports across modules.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use crate::model::*;
 
-#[derive(Debug, Clone, PartialEq)]
+const RESOLVE_DEPTH_LIMIT: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     StrLit(String),
     NumLit(String),
@@ -25,7 +28,7 @@ pub enum Ty {
     Opaque(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RProp {
     pub name: String,
     pub ty: Ty,
@@ -35,15 +38,25 @@ pub struct RProp {
 pub struct Resolver<'m> {
     pub modules: &'m [ModuleInfo],
     pub by_path: &'m HashMap<PathBuf, ModuleId>,
+    /// Memoized top-level name resolutions; names are re-queried once per call
+    /// argument, which is quadratic without this.
+    cache: RwLock<HashMap<(ModuleId, String), Ty>>,
 }
 
-impl Resolver<'_> {
+impl<'m> Resolver<'m> {
+    pub fn new(modules: &'m [ModuleInfo], by_path: &'m HashMap<PathBuf, ModuleId>) -> Self {
+        Self { modules, by_path, cache: RwLock::new(HashMap::new()) }
+    }
+
     pub fn resolve_expr(&self, te: &TypeExpr, mid: ModuleId) -> Ty {
         let mut stack = Vec::new();
         self.resolve_inner(te, mid, &mut stack)
     }
 
     fn resolve_inner(&self, te: &TypeExpr, mid: ModuleId, stack: &mut Vec<(ModuleId, String)>) -> Ty {
+        if stack.len() > RESOLVE_DEPTH_LIMIT {
+            return Ty::Opaque("<deep>".to_string());
+        }
         match te {
             TypeExpr::Ref(name) => self.resolve_name(name, mid, stack),
             TypeExpr::Union(parts) => {
@@ -82,9 +95,31 @@ impl Resolver<'_> {
 
     fn resolve_name(&self, name: &str, mid: ModuleId, stack: &mut Vec<(ModuleId, String)>) -> Ty {
         let key = (mid, name.to_string());
-        if stack.contains(&key) {
+        if stack.contains(&key) || stack.len() > RESOLVE_DEPTH_LIMIT {
             return Ty::Opaque(name.to_string());
         }
+        // Only cache resolutions that started outside any alias chain, so
+        // cycle-truncated intermediates never poison the cache.
+        let cacheable = stack.is_empty();
+        if cacheable {
+            if let Some(t) = self.cache.read().unwrap().get(&key) {
+                return t.clone();
+            }
+        }
+        let t = self.resolve_name_uncached(name, mid, stack, &key);
+        if cacheable {
+            self.cache.write().unwrap().insert(key, t.clone());
+        }
+        t
+    }
+
+    fn resolve_name_uncached(
+        &self,
+        name: &str,
+        mid: ModuleId,
+        stack: &mut Vec<(ModuleId, String)>,
+        key: &(ModuleId, String),
+    ) -> Ty {
         let m = &self.modules[mid];
         if let Some(members) = m.enums.get(name) {
             return Ty::Union(
@@ -95,20 +130,58 @@ impl Resolver<'_> {
             );
         }
         if let Some(alias) = m.type_aliases.get(name) {
-            stack.push(key);
+            stack.push(key.clone());
             let t = self.resolve_inner(alias, mid, stack);
             stack.pop();
             return t;
         }
-        if let Some((path, imported)) = m.imports.get(name) {
+        if let Some((Some(path), imported)) = m.imports.get(name) {
             if let Some(&mid2) = self.by_path.get(path) {
-                stack.push(key);
+                stack.push(key.clone());
                 let t = self.resolve_name(imported, mid2, stack);
                 stack.pop();
                 return t;
             }
         }
+        // Types can also arrive through re-export chains.
+        if let Some(t) = self.resolve_reexported(name, mid, stack) {
+            return t;
+        }
         Ty::Opaque(name.to_string())
+    }
+
+    fn resolve_reexported(&self, name: &str, mid: ModuleId, stack: &mut Vec<(ModuleId, String)>) -> Option<Ty> {
+        let m = &self.modules[mid];
+        if let Some((Some(path), source_name)) = m.reexports_named.get(name) {
+            if let Some(&mid2) = self.by_path.get(path) {
+                let key = (mid, format!("reexport:{name}"));
+                if stack.contains(&key) || stack.len() > RESOLVE_DEPTH_LIMIT {
+                    return Some(Ty::Opaque(name.to_string()));
+                }
+                stack.push(key);
+                let t = self.resolve_name(source_name, mid2, stack);
+                stack.pop();
+                return Some(t);
+            }
+        }
+        for star in &m.reexports_star {
+            if let Some(path) = star {
+                if let Some(&mid2) = self.by_path.get(path) {
+                    let m2 = &self.modules[mid2];
+                    if m2.type_aliases.contains_key(name) || m2.enums.contains_key(name) {
+                        let key = (mid, format!("star:{name}"));
+                        if stack.contains(&key) || stack.len() > RESOLVE_DEPTH_LIMIT {
+                            return Some(Ty::Opaque(name.to_string()));
+                        }
+                        stack.push(key);
+                        let t = self.resolve_name(name, mid2, stack);
+                        stack.pop();
+                        return Some(t);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Resolve an observed argument in the module where the call appears.
@@ -126,7 +199,7 @@ impl Resolver<'_> {
                     if members.contains(member) {
                         return Ty::EnumLit { enum_name: enum_name.clone(), member: member.clone() };
                     }
-                } else if let Some((path, imported)) = m.imports.get(enum_name) {
+                } else if let Some((Some(path), imported)) = m.imports.get(enum_name) {
                     if let Some(&mid2) = self.by_path.get(path) {
                         if let Some(members) = self.modules[mid2].enums.get(imported) {
                             if members.contains(member) {
@@ -149,13 +222,8 @@ impl Resolver<'_> {
 }
 
 fn dedupe(v: &mut Vec<Ty>) {
-    let mut out: Vec<Ty> = Vec::with_capacity(v.len());
-    for t in v.drain(..) {
-        if !out.contains(&t) {
-            out.push(t);
-        }
-    }
-    *v = out;
+    let mut seen: HashSet<Ty> = HashSet::with_capacity(v.len());
+    v.retain(|t| seen.insert(t.clone()));
 }
 
 pub fn print_ty(t: &Ty) -> String {

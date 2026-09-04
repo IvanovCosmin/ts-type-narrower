@@ -1,5 +1,10 @@
 //! Per-file extraction: parse with oxc, convert everything the analysis needs
 //! into the owned IR in `model`, drop the AST. Runs in parallel across files.
+//!
+//! Soundness invariant: any reference this pass cannot attribute precisely
+//! must be recorded as a (possibly broad) escape or an opaque observation —
+//! never silently dropped. Dropped calls manufacture false "never passed"
+//! findings; broad escapes only cost coverage.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,14 +17,22 @@ use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::scope::ScopeFlags;
 
 use crate::model::*;
+use crate::workspace::SpecifierMap;
+
+const TYPE_DEPTH_LIMIT: usize = 200;
+const STMT_DEPTH_LIMIT: usize = 500;
 
 /// What a name in scope refers to, for conservative resolution.
 #[derive(Debug, Clone)]
 enum Binding {
     /// Top-level function or const-bound arrow/function expression (a call target).
     Fn,
-    /// Imported binding; resolved through the module's import map at link time.
+    /// Imported binding (named or default); resolved through the module's
+    /// import map at link time. Unresolvable imports still get this binding so
+    /// their uses taint by name instead of vanishing.
     Import,
+    /// `import * as ns from ...`.
+    Namespace,
     Const { ann: Option<TypeExpr>, lit: Option<Observed> },
     Param { ann: Option<TypeExpr> },
     /// `const obj = { m() {} }` — methods are call targets.
@@ -28,12 +41,12 @@ enum Binding {
     Instance(String),
     ClassDecl,
     EnumDecl,
-    /// Anything else local (let, nested function, catch var, …): shadows outer
-    /// names, resolves to nothing analyzable.
+    /// Anything else local (let, nested function, catch var, block shadow, …):
+    /// shadows outer names; calls through it are unattributable.
     LocalOther,
 }
 
-pub fn extract_module(path: &Path, rel: String, source: &str) -> ModuleInfo {
+pub fn extract_module(path: &Path, rel: String, source: &str, specmap: &SpecifierMap) -> ModuleInfo {
     let tsx = path.extension().is_some_and(|e| e == "tsx");
     let source_type = if tsx { SourceType::tsx() } else { SourceType::ts() };
     let allocator = Allocator::default();
@@ -53,7 +66,7 @@ pub fn extract_module(path: &Path, rel: String, source: &str) -> ModuleInfo {
 
     // ---- Pre-pass: top-level declarations, bindings, type environment. ----
     for stmt in &ret.program.body {
-        prepass_stmt(stmt, false, source, path, &line_starts, &mut info, &mut module_scope, &mut exported, &mut bodyless_fns);
+        prepass_stmt(stmt, source, path, specmap, &line_starts, &mut info, &mut module_scope, &mut exported, &mut bodyless_fns);
     }
 
     // Overloads / merged declarations: any name with a bodyless signature or a
@@ -69,16 +82,27 @@ pub fn extract_module(path: &Path, rel: String, source: &str) -> ModuleInfo {
         if d.owner == Owner::Free && bodyless_fns.contains(&d.name) {
             d.eligible = false;
         }
-        if exported.contains(&d.name) && d.owner == Owner::Free {
-            d.exported = true;
+        // Export via modifier was set at declaration time; extend to names in
+        // `export { ... }` / `export default`, including class/object owners.
+        let owner_name = match &d.owner {
+            Owner::Free => Some(&d.name),
+            Owner::Class(c) | Owner::ObjectConst(c) => Some(c),
+        };
+        if let Some(n) = owner_name {
+            if exported.contains(n) || info.default_export.as_deref() == Some(n) {
+                d.exported = true;
+            }
         }
     }
 
     // ---- Usage pass. ----
     let mut v = UsageVisitor {
         src: source,
+        line_starts: &line_starts,
         scopes: vec![module_scope],
+        type_shadows: vec![HashSet::new()],
         usages: Vec::new(),
+        emitted_escapes: HashSet::new(),
     };
     v.visit_program(&ret.program);
     info.usages = v.usages;
@@ -114,12 +138,80 @@ fn canonical_num(v: f64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Import resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve an import specifier to an on-disk module file. `None` means
+/// unresolvable — the caller must record the import as unresolved (taint),
+/// never drop it.
+fn resolve_import(from: &Path, spec: &str, specmap: &SpecifierMap) -> Option<PathBuf> {
+    if spec.starts_with('.') {
+        let dir = from.parent()?;
+        probe_candidates(&normalize(&dir.join(spec)))
+    } else {
+        specmap.resolve(spec).iter().find_map(|base| probe_candidates(&normalize(base)))
+    }
+}
+
+/// Try the TypeScript file-candidate dance for a base path: extension
+/// appending (never `with_extension`, which eats dotted names like
+/// `foo.service`), `.js`-family suffix swaps, and index files.
+fn probe_candidates(base: &Path) -> Option<PathBuf> {
+    let s = base.to_string_lossy();
+    let mut cands: Vec<PathBuf> = Vec::new();
+    for (js, ts) in [(".js", ".ts"), (".js", ".tsx"), (".jsx", ".tsx"), (".mjs", ".mts"), (".cjs", ".cts")] {
+        if let Some(stripped) = s.strip_suffix(js) {
+            cands.push(PathBuf::from(format!("{stripped}{ts}")));
+        }
+    }
+    cands.push(PathBuf::from(format!("{s}.ts")));
+    cands.push(PathBuf::from(format!("{s}.tsx")));
+    if base
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e, "ts" | "tsx" | "mts" | "cts"))
+    {
+        cands.push(base.to_path_buf());
+    }
+    for idx in ["index.ts", "index.tsx", "src/index.ts", "src/index.tsx"] {
+        cands.push(base.join(idx));
+    }
+    cands.into_iter().find(|c| c.is_file())
+}
+
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn export_name_to_string(n: &ModuleExportName) -> String {
+    match n {
+        ModuleExportName::IdentifierName(x) => x.name.to_string(),
+        ModuleExportName::IdentifierReference(x) => x.name.to_string(),
+        ModuleExportName::StringLiteral(x) => x.value.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-pass
+// ---------------------------------------------------------------------------
+
 #[allow(clippy::too_many_arguments)]
 fn prepass_stmt(
     stmt: &Statement,
-    exported_ctx: bool,
     src: &str,
     path: &Path,
+    specmap: &SpecifierMap,
     line_starts: &[u32],
     info: &mut ModuleInfo,
     scope: &mut HashMap<String, Binding>,
@@ -129,95 +221,80 @@ fn prepass_stmt(
     match stmt {
         Statement::ImportDeclaration(d) => {
             let Some(specs) = &d.specifiers else { return };
-            let source_path = resolve_import(path, d.source.value.as_str());
+            let source_path = resolve_import(path, d.source.value.as_str(), specmap);
             for s in specs {
                 match s {
                     ImportDeclarationSpecifier::ImportSpecifier(is) => {
-                        let imported = match &is.imported {
-                            ModuleExportName::IdentifierName(n) => n.name.to_string(),
-                            ModuleExportName::IdentifierReference(n) => n.name.to_string(),
-                            ModuleExportName::StringLiteral(sl) => sl.value.to_string(),
-                        };
+                        let imported = export_name_to_string(&is.imported);
                         let local = is.local.name.to_string();
-                        if let Some(sp) = &source_path {
-                            info.imports.insert(local.clone(), (sp.clone(), imported));
-                            scope.insert(local, Binding::Import);
-                        } else {
-                            scope.insert(local, Binding::LocalOther);
-                        }
+                        info.imports.insert(local.clone(), (source_path.clone(), imported));
+                        scope.insert(local, Binding::Import);
                     }
-                    _ => {
-                        // Default / namespace imports: unsupported, shadow only.
-                        let name = match s {
-                            ImportDeclarationSpecifier::ImportDefaultSpecifier(x) => x.local.name.to_string(),
-                            ImportDeclarationSpecifier::ImportNamespaceSpecifier(x) => x.local.name.to_string(),
-                            _ => unreachable!(),
-                        };
-                        scope.insert(name, Binding::LocalOther);
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(x) => {
+                        let local = x.local.name.to_string();
+                        info.imports.insert(local.clone(), (source_path.clone(), "default".to_string()));
+                        scope.insert(local, Binding::Import);
+                    }
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(x) => {
+                        let local = x.local.name.to_string();
+                        info.imports.insert(local.clone(), (source_path.clone(), "*".to_string()));
+                        scope.insert(local, Binding::Namespace);
                     }
                 }
             }
         }
         Statement::ExportNamedDeclaration(d) => {
-            for s in &d.specifiers {
-                if let ModuleExportName::IdentifierReference(n) = &s.local {
-                    exported.insert(n.name.to_string());
+            if let Some(source) = &d.source {
+                // Re-export: `export { a as b } from "./m"`.
+                let source_path = resolve_import(path, source.value.as_str(), specmap);
+                for s in &d.specifiers {
+                    let exported_name = export_name_to_string(&s.exported);
+                    let source_name = export_name_to_string(&s.local);
+                    info.reexports_named.insert(exported_name, (source_path.clone(), source_name));
+                }
+            } else {
+                for s in &d.specifiers {
+                    exported.insert(export_name_to_string(&s.local));
                 }
             }
             if let Some(decl) = &d.declaration {
-                prepass_declaration(decl, true, src, path, line_starts, info, scope, exported, bodyless_fns);
+                prepass_declaration(decl, true, src, path, specmap, line_starts, info, scope);
             }
         }
-        Statement::ExportDefaultDeclaration(d) => {
-            match &d.declaration {
-                ExportDefaultDeclarationKind::Identifier(id) => {
-                    exported.insert(id.name.to_string());
-                }
-                ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
-                    prepass_function(f, true, src, line_starts, info, scope, bodyless_fns);
-                }
-                _ => {}
+        Statement::ExportAllDeclaration(d) => {
+            // `export * as ns from ...` re-exports a namespace object; we model
+            // it as an unresolvable star so misses taint instead of vanishing.
+            if d.exported.is_some() {
+                info.reexports_star.push(None);
+            } else {
+                info.reexports_star.push(resolve_import(path, d.source.value.as_str(), specmap));
             }
         }
-        Statement::VariableDeclaration(v) => {
-            prepass_var(v, exported_ctx, src, line_starts, info, scope);
-        }
-        Statement::FunctionDeclaration(f) => {
-            prepass_function(f, exported_ctx, src, line_starts, info, scope, bodyless_fns);
-        }
-        Statement::ClassDeclaration(c) => {
-            prepass_class(c, exported_ctx, src, line_starts, info, scope);
-        }
-        Statement::TSTypeAliasDeclaration(t) => {
-            let expr = if t.type_parameters.is_some() {
-                TypeExpr::Opaque(span_text(src, t.span).to_string())
-            } else {
-                ts_type_to_expr(&t.type_annotation, src)
-            };
-            info.type_aliases.insert(t.id.name.to_string(), expr);
-        }
-        Statement::TSInterfaceDeclaration(t) => {
-            let expr = if t.type_parameters.is_some() || !t.extends.is_empty() {
-                TypeExpr::Opaque(span_text(src, t.span).to_string())
-            } else {
-                signatures_to_object(&t.body.body, src)
-            };
-            info.type_aliases.insert(t.id.name.to_string(), expr);
-        }
-        Statement::TSEnumDeclaration(t) => {
-            let members = t
-                .body
-                .members
-                .iter()
-                .filter_map(|m| match &m.id {
-                    TSEnumMemberName::Identifier(n) => Some(n.name.to_string()),
-                    TSEnumMemberName::String(s) => Some(s.value.to_string()),
-                    _ => None,
-                })
-                .collect();
-            info.enums.insert(t.id.name.to_string(), members);
-            scope.insert(t.id.name.to_string(), Binding::EnumDecl);
-        }
+        Statement::ExportDefaultDeclaration(d) => match &d.declaration {
+            ExportDefaultDeclarationKind::Identifier(id) => {
+                info.default_export = Some(id.name.to_string());
+                exported.insert(id.name.to_string());
+            }
+            ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                prepass_function(f, true, src, line_starts, info, scope, bodyless_fns);
+                if let Some(id) = &f.id {
+                    info.default_export = Some(id.name.to_string());
+                }
+            }
+            ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                prepass_class(c, true, src, line_starts, info, scope);
+                if let Some(id) = &c.id {
+                    info.default_export = Some(id.name.to_string());
+                }
+            }
+            _ => {}
+        },
+        Statement::VariableDeclaration(v) => prepass_var(v, false, src, path, specmap, line_starts, info, scope),
+        Statement::FunctionDeclaration(f) => prepass_function(f, false, src, line_starts, info, scope, bodyless_fns),
+        Statement::ClassDeclaration(c) => prepass_class(c, false, src, line_starts, info, scope),
+        Statement::TSTypeAliasDeclaration(t) => prepass_type_alias(t, src, info),
+        Statement::TSInterfaceDeclaration(t) => prepass_interface(t, src, info),
+        Statement::TSEnumDeclaration(t) => prepass_enum(t, info, scope),
         _ => {}
     }
 }
@@ -228,51 +305,72 @@ fn prepass_declaration(
     exported_ctx: bool,
     src: &str,
     path: &Path,
+    specmap: &SpecifierMap,
     line_starts: &[u32],
     info: &mut ModuleInfo,
     scope: &mut HashMap<String, Binding>,
-    exported: &mut HashSet<String>,
-    bodyless_fns: &mut HashSet<String>,
 ) {
-    // Reuse the statement handler through a small shim: only declaration kinds
-    // that can appear under `export` matter here.
+    let mut bodyless = HashSet::new();
     match decl {
-        Declaration::VariableDeclaration(v) => prepass_var(v, exported_ctx, src, line_starts, info, scope),
-        Declaration::FunctionDeclaration(f) => prepass_function(f, exported_ctx, src, line_starts, info, scope, bodyless_fns),
+        Declaration::VariableDeclaration(v) => prepass_var(v, exported_ctx, src, path, specmap, line_starts, info, scope),
+        Declaration::FunctionDeclaration(f) => {
+            prepass_function(f, exported_ctx, src, line_starts, info, scope, &mut bodyless);
+            // A bodyless `export function` signature: mark via decls pass by
+            // inserting a duplicate-suppressor. Simplest: mark ineligible now.
+            if !bodyless.is_empty() {
+                for d in &mut info.decls {
+                    if d.owner == Owner::Free && bodyless.contains(&d.name) {
+                        d.eligible = false;
+                    }
+                }
+            }
+        }
         Declaration::ClassDeclaration(c) => prepass_class(c, exported_ctx, src, line_starts, info, scope),
-        Declaration::TSTypeAliasDeclaration(t) => {
-            let expr = if t.type_parameters.is_some() {
-                TypeExpr::Opaque(span_text(src, t.span).to_string())
-            } else {
-                ts_type_to_expr(&t.type_annotation, src)
-            };
-            info.type_aliases.insert(t.id.name.to_string(), expr);
-        }
-        Declaration::TSInterfaceDeclaration(t) => {
-            let expr = if t.type_parameters.is_some() || !t.extends.is_empty() {
-                TypeExpr::Opaque(span_text(src, t.span).to_string())
-            } else {
-                signatures_to_object(&t.body.body, src)
-            };
-            info.type_aliases.insert(t.id.name.to_string(), expr);
-        }
-        Declaration::TSEnumDeclaration(t) => {
-            let members = t
-                .body
-                .members
-                .iter()
-                .filter_map(|m| match &m.id {
-                    TSEnumMemberName::Identifier(n) => Some(n.name.to_string()),
-                    TSEnumMemberName::String(s) => Some(s.value.to_string()),
-                    _ => None,
-                })
-                .collect();
-            info.enums.insert(t.id.name.to_string(), members);
-            scope.insert(t.id.name.to_string(), Binding::EnumDecl);
-        }
+        Declaration::TSTypeAliasDeclaration(t) => prepass_type_alias(t, src, info),
+        Declaration::TSInterfaceDeclaration(t) => prepass_interface(t, src, info),
+        Declaration::TSEnumDeclaration(t) => prepass_enum(t, info, scope),
         _ => {}
     }
-    let _ = (exported, path);
+}
+
+fn prepass_type_alias(t: &TSTypeAliasDeclaration, src: &str, info: &mut ModuleInfo) {
+    let name = t.id.name.to_string();
+    let expr = if t.type_parameters.is_some() || info.type_aliases.contains_key(&name) {
+        // Generic aliases and merged/duplicate declarations are unmodeled.
+        TypeExpr::Opaque(span_text(src, t.span).to_string())
+    } else {
+        ts_type_to_expr(&t.type_annotation, src, 0)
+    };
+    info.type_aliases.insert(name, expr);
+}
+
+fn prepass_interface(t: &TSInterfaceDeclaration, src: &str, info: &mut ModuleInfo) {
+    let name = t.id.name.to_string();
+    let expr = if t.type_parameters.is_some() || !t.extends.is_empty() || info.type_aliases.contains_key(&name) {
+        // Declaration merging (a second interface of the same name) makes the
+        // combined shape unknowable to us: degrade to Opaque.
+        TypeExpr::Opaque(span_text(src, t.span).to_string())
+    } else {
+        signatures_to_object(&t.body.body, src, 0)
+    };
+    info.type_aliases.insert(name, expr);
+}
+
+fn prepass_enum(t: &TSEnumDeclaration, info: &mut ModuleInfo, scope: &mut HashMap<String, Binding>) {
+    let name = t.id.name.to_string();
+    let members: Vec<String> = t
+        .body
+        .members
+        .iter()
+        .filter_map(|m| match &m.id {
+            TSEnumMemberName::Identifier(n) => Some(n.name.to_string()),
+            TSEnumMemberName::String(s) => Some(s.value.to_string()),
+            _ => None,
+        })
+        .collect();
+    // Merged enum declarations: extend, don't overwrite.
+    info.enums.entry(name.clone()).or_default().extend(members);
+    scope.insert(name, Binding::EnumDecl);
 }
 
 fn prepass_function(
@@ -288,7 +386,6 @@ fn prepass_function(
     let name = id.name.to_string();
     scope.insert(name.clone(), Binding::Fn);
     if f.body.is_none() {
-        // Overload signature or `declare function`.
         bodyless_fns.insert(name);
         return;
     }
@@ -315,6 +412,15 @@ fn prepass_class(
     let Some(id) = &c.id else { return };
     let class_name = id.name.to_string();
     scope.insert(class_name.clone(), Binding::ClassDecl);
+    // Inheritance is unmodeled: a subclass can expose this class's methods
+    // under its own name (see link-time AnyMethodNamed handling); a class that
+    // *extends* something also inherits methods we can't see. Mark methods of
+    // deriving classes ineligible-safe by leaving them out when a superclass
+    // exists? No: analyzing them is fine — calls on subclass instances that we
+    // can't attribute already escape by method name. But methods of THIS class
+    // may be called through subclass instances whose class we resolve —
+    // handled at link time by falling back to AnyMethodNamed when the
+    // (class, method) pair is missing.
     for el in &c.body.body {
         if let ClassElement::MethodDefinition(m) = el {
             if m.kind != MethodDefinitionKind::Method || m.r#static || m.computed {
@@ -339,10 +445,13 @@ fn prepass_class(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepass_var(
     v: &VariableDeclaration,
     exported_ctx: bool,
     src: &str,
+    path: &Path,
+    specmap: &SpecifierMap,
     line_starts: &[u32],
     info: &mut ModuleInfo,
     scope: &mut HashMap<String, Binding>,
@@ -351,6 +460,13 @@ fn prepass_var(
     for d in &v.declarations {
         let BindingPattern::BindingIdentifier(id) = &d.id else { continue };
         let name = id.name.to_string();
+        // `const m = await import("./x")` binds a namespace-like object.
+        if let Some(spec) = dynamic_import_specifier(d.init.as_ref()) {
+            let resolved = resolve_import(path, &spec, specmap);
+            info.imports.insert(name.clone(), (resolved, "*".to_string()));
+            scope.insert(name, Binding::Namespace);
+            continue;
+        }
         let binding = classify_declarator(d, is_const, name.as_str(), exported_ctx, src, line_starts, Some(info));
         scope.insert(name, binding);
     }
@@ -367,7 +483,7 @@ fn classify_declarator(
     line_starts: &[u32],
     info: Option<&mut ModuleInfo>,
 ) -> Binding {
-    let ann = d.type_annotation.as_ref().map(|t| ts_type_to_expr(&t.type_annotation, src));
+    let ann = d.type_annotation.as_ref().map(|t| ts_type_to_expr(&t.type_annotation, src, 0));
     match &d.init {
         Some(Expression::ArrowFunctionExpression(a)) => {
             if let Some(info) = info {
@@ -412,40 +528,25 @@ fn classify_declarator(
                         continue;
                     }
                     let PropertyKey::StaticIdentifier(key) = &prop.key else { continue };
-                    let func = match &prop.value {
-                        Expression::FunctionExpression(f) => {
-                            if f.body.is_none() {
-                                continue;
-                            }
-                            has_methods = true;
-                            let eligible = f.type_parameters.is_none() && params_eligible(&f.params);
-                            info.decls.push(FnDecl {
-                                name: key.name.to_string(),
-                                owner: Owner::ObjectConst(name.to_string()),
-                                params: extract_params(&f.params, src),
-                                line: line_of(line_starts, prop.span.start),
-                                end_line: line_of(line_starts, prop.span.end),
-                                exported: exported_ctx,
-                                eligible,
-                            });
-                            continue;
-                        }
-                        Expression::ArrowFunctionExpression(a) => Some(a),
-                        _ => None,
+                    let (params, type_params, has_body, span) = match &prop.value {
+                        Expression::FunctionExpression(f) => (&f.params, &f.type_parameters, f.body.is_some(), prop.span),
+                        Expression::ArrowFunctionExpression(a) => (&a.params, &a.type_parameters, true, prop.span),
+                        _ => continue,
                     };
-                    if let Some(a) = func {
-                        has_methods = true;
-                        let eligible = a.type_parameters.is_none() && params_eligible(&a.params);
-                        info.decls.push(FnDecl {
-                            name: key.name.to_string(),
-                            owner: Owner::ObjectConst(name.to_string()),
-                            params: extract_params(&a.params, src),
-                            line: line_of(line_starts, prop.span.start),
-                            end_line: line_of(line_starts, prop.span.end),
-                            exported: exported_ctx,
-                            eligible,
-                        });
+                    if !has_body {
+                        continue;
                     }
+                    has_methods = true;
+                    let eligible = type_params.is_none() && params_eligible(params);
+                    info.decls.push(FnDecl {
+                        name: key.name.to_string(),
+                        owner: Owner::ObjectConst(name.to_string()),
+                        params: extract_params(params, src),
+                        line: line_of(line_starts, span.start),
+                        end_line: line_of(line_starts, span.end),
+                        exported: exported_ctx,
+                        eligible,
+                    });
                 }
             }
             if has_methods { Binding::ObjectConst } else { Binding::Const { ann, lit: None } }
@@ -473,6 +574,21 @@ fn classify_declarator(
             }
         }
     }
+}
+
+/// `import("./x")` or `await import("./x")` with a literal specifier.
+fn dynamic_import_specifier(init: Option<&Expression>) -> Option<String> {
+    let e = init?;
+    let inner = match e {
+        Expression::AwaitExpression(a) => &a.argument,
+        other => other,
+    };
+    if let Expression::ImportExpression(imp) = inner {
+        if let Expression::StringLiteral(s) = &imp.source {
+            return Some(s.value.to_string());
+        }
+    }
+    None
 }
 
 fn simple_literal(e: &Expression) -> Option<Observed> {
@@ -503,7 +619,7 @@ fn extract_params(params: &FormalParameters, src: &str) -> Vec<ParamInfo> {
             };
             let (ty, ty_text) = match &p.type_annotation {
                 Some(t) => (
-                    Some(ts_type_to_expr(&t.type_annotation, src)),
+                    Some(ts_type_to_expr(&t.type_annotation, src, 0)),
                     Some(span_text(src, t.type_annotation.span()).to_string()),
                 ),
                 None => (None, None),
@@ -519,7 +635,10 @@ fn extract_params(params: &FormalParameters, src: &str) -> Vec<ParamInfo> {
         .collect()
 }
 
-fn signatures_to_object(members: &[TSSignature], src: &str) -> TypeExpr {
+fn signatures_to_object(members: &[TSSignature], src: &str, depth: usize) -> TypeExpr {
+    if depth > TYPE_DEPTH_LIMIT {
+        return TypeExpr::Opaque("<deep>".to_string());
+    }
     let mut props = Vec::new();
     for m in members {
         match m {
@@ -533,7 +652,7 @@ fn signatures_to_object(members: &[TSSignature], src: &str) -> TypeExpr {
                     _ => return TypeExpr::Opaque("<interface>".to_string()),
                 };
                 let ty = match &ps.type_annotation {
-                    Some(t) => ts_type_to_expr(&t.type_annotation, src),
+                    Some(t) => ts_type_to_expr(&t.type_annotation, src, depth + 1),
                     None => TypeExpr::Any,
                 };
                 props.push(ObjProp { name, ty, optional: ps.optional });
@@ -544,9 +663,12 @@ fn signatures_to_object(members: &[TSSignature], src: &str) -> TypeExpr {
     TypeExpr::ObjectLit(props)
 }
 
-pub fn ts_type_to_expr(t: &TSType, src: &str) -> TypeExpr {
+pub fn ts_type_to_expr(t: &TSType, src: &str, depth: usize) -> TypeExpr {
+    if depth > TYPE_DEPTH_LIMIT {
+        return TypeExpr::Opaque("<deep>".to_string());
+    }
     match t {
-        TSType::TSUnionType(u) => TypeExpr::Union(u.types.iter().map(|x| ts_type_to_expr(x, src)).collect()),
+        TSType::TSUnionType(u) => TypeExpr::Union(u.types.iter().map(|x| ts_type_to_expr(x, src, depth + 1)).collect()),
         TSType::TSLiteralType(l) => match &l.literal {
             TSLiteral::StringLiteral(s) => TypeExpr::StrLit(s.value.to_string()),
             TSLiteral::NumericLiteral(n) => TypeExpr::NumLit(canonical_num(n.value)),
@@ -562,7 +684,7 @@ pub fn ts_type_to_expr(t: &TSType, src: &str) -> TypeExpr {
                 _ => TypeExpr::Opaque(span_text(src, r.span).to_string()),
             }
         }
-        TSType::TSTypeLiteral(o) => signatures_to_object(&o.members, src),
+        TSType::TSTypeLiteral(o) => signatures_to_object(&o.members, src, depth + 1),
         TSType::TSStringKeyword(_) => TypeExpr::Str,
         TSType::TSNumberKeyword(_) => TypeExpr::Num,
         TSType::TSBooleanKeyword(_) => TypeExpr::Bool,
@@ -570,44 +692,146 @@ pub fn ts_type_to_expr(t: &TSType, src: &str) -> TypeExpr {
         TSType::TSNullKeyword(_) => TypeExpr::Null,
         TSType::TSAnyKeyword(_) => TypeExpr::Any,
         TSType::TSUnknownKeyword(_) => TypeExpr::Unknown,
-        TSType::TSParenthesizedType(p) => ts_type_to_expr(&p.type_annotation, src),
+        TSType::TSParenthesizedType(p) => ts_type_to_expr(&p.type_annotation, src, depth + 1),
         other => TypeExpr::Opaque(span_text(src, other.span()).to_string()),
     }
 }
 
-fn resolve_import(from: &Path, spec: &str) -> Option<PathBuf> {
-    if !spec.starts_with('.') {
-        return None;
+/// Collect every `Ref` name mentioned in a type expression.
+fn collect_refs<'a>(te: &'a TypeExpr, out: &mut Vec<&'a str>) {
+    match te {
+        TypeExpr::Ref(n) => out.push(n),
+        TypeExpr::Union(parts) => parts.iter().for_each(|p| collect_refs(p, out)),
+        TypeExpr::ObjectLit(props) => props.iter().for_each(|p| collect_refs(&p.ty, out)),
+        _ => {}
     }
-    let dir = from.parent()?;
-    let base = normalize(&dir.join(spec));
-    let candidates = [
-        base.with_extension("ts"),
-        base.with_extension("tsx"),
-        base.clone(),
-        base.join("index.ts"),
-        base.join("index.tsx"),
-    ];
-    for c in &candidates {
-        if c.is_file() {
-            return Some(c.clone());
-        }
-    }
-    Some(base.with_extension("ts"))
 }
 
-fn normalize(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other),
-        }
+// ---------------------------------------------------------------------------
+// Function-body pre-scan: every name *declared anywhere* in a function body
+// (at any block depth, excluding nested function bodies) shadows outer scopes
+// for the whole function. Registering them up-front as LocalOther means
+// references before/inside blocks degrade to "unattributable" (escape/opaque)
+// instead of wrongly binding to an outer declaration.
+// ---------------------------------------------------------------------------
+
+fn scan_stmts(stmts: &[Statement], values: &mut HashMap<String, Binding>, types: &mut HashSet<String>, depth: usize) {
+    if depth > STMT_DEPTH_LIMIT {
+        return;
     }
-    out
+    for stmt in stmts {
+        scan_stmt(stmt, values, types, depth);
+    }
+}
+
+fn scan_stmt(stmt: &Statement, values: &mut HashMap<String, Binding>, types: &mut HashSet<String>, depth: usize) {
+    if depth > STMT_DEPTH_LIMIT {
+        return;
+    }
+    match stmt {
+        Statement::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                bind_pattern_names(&d.id, values);
+            }
+        }
+        Statement::FunctionDeclaration(f) => {
+            if let Some(id) = &f.id {
+                values.insert(id.name.to_string(), Binding::LocalOther);
+            }
+        }
+        Statement::ClassDeclaration(c) => {
+            if let Some(id) = &c.id {
+                values.insert(id.name.to_string(), Binding::LocalOther);
+            }
+        }
+        Statement::TSTypeAliasDeclaration(t) => {
+            types.insert(t.id.name.to_string());
+        }
+        Statement::TSInterfaceDeclaration(t) => {
+            types.insert(t.id.name.to_string());
+        }
+        Statement::TSEnumDeclaration(t) => {
+            types.insert(t.id.name.to_string());
+            values.insert(t.id.name.to_string(), Binding::LocalOther);
+        }
+        Statement::BlockStatement(b) => scan_stmts(&b.body, values, types, depth + 1),
+        Statement::IfStatement(s) => {
+            scan_stmt(&s.consequent, values, types, depth + 1);
+            if let Some(alt) = &s.alternate {
+                scan_stmt(alt, values, types, depth + 1);
+            }
+        }
+        Statement::ForStatement(s) => {
+            if let Some(ForStatementInit::VariableDeclaration(v)) = &s.init {
+                for d in &v.declarations {
+                    bind_pattern_names(&d.id, values);
+                }
+            }
+            scan_stmt(&s.body, values, types, depth + 1);
+        }
+        Statement::ForInStatement(s) => {
+            if let ForStatementLeft::VariableDeclaration(v) = &s.left {
+                for d in &v.declarations {
+                    bind_pattern_names(&d.id, values);
+                }
+            }
+            scan_stmt(&s.body, values, types, depth + 1);
+        }
+        Statement::ForOfStatement(s) => {
+            if let ForStatementLeft::VariableDeclaration(v) = &s.left {
+                for d in &v.declarations {
+                    bind_pattern_names(&d.id, values);
+                }
+            }
+            scan_stmt(&s.body, values, types, depth + 1);
+        }
+        Statement::WhileStatement(s) => scan_stmt(&s.body, values, types, depth + 1),
+        Statement::DoWhileStatement(s) => scan_stmt(&s.body, values, types, depth + 1),
+        Statement::SwitchStatement(s) => {
+            for case in &s.cases {
+                scan_stmts(&case.consequent, values, types, depth + 1);
+            }
+        }
+        Statement::TryStatement(s) => {
+            scan_stmts(&s.block.body, values, types, depth + 1);
+            if let Some(h) = &s.handler {
+                if let Some(p) = &h.param {
+                    bind_pattern_names(&p.pattern, values);
+                }
+                scan_stmts(&h.body.body, values, types, depth + 1);
+            }
+            if let Some(f) = &s.finalizer {
+                scan_stmts(&f.body, values, types, depth + 1);
+            }
+        }
+        Statement::LabeledStatement(s) => scan_stmt(&s.body, values, types, depth + 1),
+        _ => {}
+    }
+}
+
+fn bind_pattern_names(p: &BindingPattern, scope: &mut HashMap<String, Binding>) {
+    match p {
+        BindingPattern::BindingIdentifier(id) => {
+            scope.insert(id.name.to_string(), Binding::LocalOther);
+        }
+        BindingPattern::ObjectPattern(o) => {
+            for prop in &o.properties {
+                bind_pattern_names(&prop.value, scope);
+            }
+            if let Some(rest) = &o.rest {
+                bind_pattern_names(&rest.argument, scope);
+            }
+        }
+        BindingPattern::ArrayPattern(a) => {
+            for el in a.elements.iter().flatten() {
+                bind_pattern_names(el, scope);
+            }
+            if let Some(rest) = &a.rest {
+                bind_pattern_names(&rest.argument, scope);
+            }
+        }
+        BindingPattern::AssignmentPattern(ap) => bind_pattern_names(&ap.left, scope),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,8 +840,14 @@ fn normalize(p: &Path) -> PathBuf {
 
 struct UsageVisitor<'s> {
     src: &'s str,
+    line_starts: &'s [u32],
     scopes: Vec<HashMap<String, Binding>>,
+    /// Locally-declared type names (aliases, interfaces, enums, type params)
+    /// per scope: any annotation mentioning one resolves to Opaque, since our
+    /// resolver only knows module-level types.
+    type_shadows: Vec<HashSet<String>>,
     usages: Vec<Usage>,
+    emitted_escapes: HashSet<(u8, String)>,
 }
 
 impl UsageVisitor<'_> {
@@ -629,11 +859,46 @@ impl UsageVisitor<'_> {
         self.scopes.last_mut().unwrap()
     }
 
-    fn push_fn_scope(&mut self, params: &FormalParameters) {
+    fn type_shadowed(&self, te: &TypeExpr) -> bool {
+        let mut refs = Vec::new();
+        collect_refs(te, &mut refs);
+        refs.iter().any(|n| self.type_shadows.iter().any(|s| s.contains(*n)))
+    }
+
+    /// Strip a type annotation that mentions locally-shadowed type names.
+    fn safe_ann(&self, ann: Option<TypeExpr>) -> Option<TypeExpr> {
+        ann.filter(|t| !self.type_shadowed(t))
+    }
+
+    fn push_fn_scope(
+        &mut self,
+        params: &FormalParameters,
+        type_parameters: Option<&TSTypeParameterDeclaration>,
+        body_stmts: Option<&[Statement]>,
+    ) {
+        let mut types = HashSet::new();
+        if let Some(tp) = type_parameters {
+            for p in &tp.params {
+                types.insert(p.name.name.to_string());
+            }
+        }
         let mut scope = HashMap::new();
+        if let Some(stmts) = body_stmts {
+            scan_stmts(stmts, &mut scope, &mut types, 0);
+        }
+        // Parameters are registered after the body pre-scan so a parameter
+        // beats a same-named inner declaration until the declarator re-inserts.
+        self.type_shadows.push(types);
         for p in &params.items {
             if let BindingPattern::BindingIdentifier(id) = &p.pattern {
-                let ann = p.type_annotation.as_ref().map(|t| ts_type_to_expr(&t.type_annotation, self.src));
+                let ann = p.type_annotation.as_ref().map(|t| ts_type_to_expr(&t.type_annotation, self.src, 0));
+                let ann = ann.filter(|t| {
+                    let mut refs = Vec::new();
+                    collect_refs(t, &mut refs);
+                    !refs
+                        .iter()
+                        .any(|n| self.type_shadows.iter().any(|s| s.contains(*n)))
+                });
                 scope.insert(id.name.to_string(), Binding::Param { ann });
             } else {
                 bind_pattern_names(&p.pattern, &mut scope);
@@ -642,7 +907,15 @@ impl UsageVisitor<'_> {
         self.scopes.push(scope);
     }
 
-    fn expr_to_observed(&self, e: &Expression) -> Observed {
+    fn pop_fn_scope(&mut self) {
+        self.scopes.pop();
+        self.type_shadows.pop();
+    }
+
+    fn expr_to_observed(&self, e: &Expression, depth: usize) -> Observed {
+        if depth > TYPE_DEPTH_LIMIT {
+            return Observed::Opaque;
+        }
         match e {
             Expression::StringLiteral(s) => Observed::StrLit(s.value.to_string()),
             Expression::NumericLiteral(n) => Observed::NumLit(canonical_num(n.value)),
@@ -654,7 +927,11 @@ impl UsageVisitor<'_> {
                 }
                 match self.lookup(id.name.as_str()) {
                     Some(Binding::Param { ann: Some(t) }) | Some(Binding::Const { ann: Some(t), .. }) => {
-                        Observed::Typed(t.clone())
+                        if self.type_shadowed(t) {
+                            Observed::Opaque
+                        } else {
+                            Observed::Typed(t.clone())
+                        }
                     }
                     Some(Binding::Const { ann: None, lit: Some(l) }) => l.clone(),
                     _ => Observed::Opaque,
@@ -684,7 +961,7 @@ impl UsageVisitor<'_> {
                                 PropertyKey::StringLiteral(s) => s.value.to_string(),
                                 _ => return Observed::Opaque,
                             };
-                            props.push((name, self.expr_to_observed(&prop.value)));
+                            props.push((name, self.expr_to_observed(&prop.value, depth + 1)));
                         }
                         ObjectPropertyKind::SpreadProperty(_) => return Observed::Opaque,
                     }
@@ -696,15 +973,16 @@ impl UsageVisitor<'_> {
                 if let TSType::TSTypeReference(r) = &a.type_annotation {
                     if let TSTypeName::IdentifierReference(id) = &r.type_name {
                         if id.name == "const" {
-                            return self.expr_to_observed(&a.expression);
+                            return self.expr_to_observed(&a.expression, depth + 1);
                         }
                     }
                 }
-                Observed::Typed(ts_type_to_expr(&a.type_annotation, self.src))
+                let te = ts_type_to_expr(&a.type_annotation, self.src, 0);
+                if self.type_shadowed(&te) { Observed::Opaque } else { Observed::Typed(te) }
             }
-            Expression::TSSatisfiesExpression(s) => self.expr_to_observed(&s.expression),
-            Expression::TSNonNullExpression(n) => self.expr_to_observed(&n.expression),
-            Expression::ParenthesizedExpression(p) => self.expr_to_observed(&p.expression),
+            Expression::TSSatisfiesExpression(s) => self.expr_to_observed(&s.expression, depth + 1),
+            Expression::TSNonNullExpression(n) => self.expr_to_observed(&n.expression, depth + 1),
+            Expression::ParenthesizedExpression(p) => self.expr_to_observed(&p.expression, depth + 1),
             _ => Observed::Opaque,
         }
     }
@@ -717,40 +995,45 @@ impl UsageVisitor<'_> {
             CallArgs::Args(
                 call.arguments
                     .iter()
-                    .map(|a| a.as_expression().map(|e| self.expr_to_observed(e)).unwrap_or(Observed::Opaque))
+                    .map(|a| a.as_expression().map(|e| self.expr_to_observed(e, 0)).unwrap_or(Observed::Opaque))
                     .collect(),
             )
         };
-        self.usages.push(Usage { target, kind: UsageKind::Call(args) });
+        let line = line_of(self.line_starts, call.span.start);
+        self.usages.push(Usage { target, kind: UsageKind::Call(args), line });
     }
 
     fn escape(&mut self, target: UsageTargetRef) {
-        self.usages.push(Usage { target, kind: UsageKind::Escape });
+        // Broad escapes flood real codebases (every property access can emit
+        // one); dedupe per module since escaping is idempotent.
+        let key = match &target {
+            UsageTargetRef::Local { owner, name } => (0u8, format!("{owner:?}|{name}")),
+            UsageTargetRef::Imported { local } => (1, local.clone()),
+            UsageTargetRef::NamespaceMember { ns_local, name } => (2, format!("{ns_local}|{name}")),
+            UsageTargetRef::AnyMethodNamed(n) => (3, n.clone()),
+            UsageTargetRef::AnyFreeNamed(n) => (4, n.clone()),
+            UsageTargetRef::AllMembersOf(o) => (5, format!("{o:?}")),
+            UsageTargetRef::AllExportsOfModule { ns_local } => (6, ns_local.clone()),
+        };
+        if self.emitted_escapes.insert(key) {
+            self.usages.push(Usage { target, kind: UsageKind::Escape, line: 0 });
+        }
     }
-}
 
-fn bind_pattern_names(p: &BindingPattern, scope: &mut HashMap<String, Binding>) {
-    match p {
-        BindingPattern::BindingIdentifier(id) => {
-            scope.insert(id.name.to_string(), Binding::LocalOther);
+    /// Escape for an identifier used as a value in an unattributable position.
+    fn escape_identifier_use(&mut self, name: &str) {
+        match self.lookup(name) {
+            Some(Binding::Fn) => self.escape(UsageTargetRef::Local { owner: Owner::Free, name: name.to_string() }),
+            Some(Binding::Import) => self.escape(UsageTargetRef::Imported { local: name.to_string() }),
+            Some(Binding::Namespace) => self.escape(UsageTargetRef::AllExportsOfModule { ns_local: name.to_string() }),
+            Some(Binding::ObjectConst) => self.escape(UsageTargetRef::AllMembersOf(Owner::ObjectConst(name.to_string()))),
+            Some(Binding::Instance(cls)) => {
+                let cls = cls.clone();
+                self.escape(UsageTargetRef::AllMembersOf(Owner::Class(cls)));
+            }
+            Some(Binding::ClassDecl) => self.escape(UsageTargetRef::AllMembersOf(Owner::Class(name.to_string()))),
+            _ => {}
         }
-        BindingPattern::ObjectPattern(o) => {
-            for prop in &o.properties {
-                bind_pattern_names(&prop.value, scope);
-            }
-            if let Some(rest) = &o.rest {
-                bind_pattern_names(&rest.argument, scope);
-            }
-        }
-        BindingPattern::ArrayPattern(a) => {
-            for el in a.elements.iter().flatten() {
-                bind_pattern_names(el, scope);
-            }
-            if let Some(rest) = &a.rest {
-                bind_pattern_names(&rest.argument, scope);
-            }
-        }
-        BindingPattern::AssignmentPattern(ap) => bind_pattern_names(&ap.left, scope),
     }
 }
 
@@ -786,14 +1069,21 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
     }
 
     fn visit_function(&mut self, it: &Function<'a>, _flags: ScopeFlags) {
-        // A nested (non-top-level) function declaration shadows its name in the
-        // enclosing scope. Top-level ones are already registered as Fn.
-        if let Some(id) = &it.id {
-            if self.scopes.len() > 1 {
+        let is_decl = it.r#type == FunctionType::FunctionDeclaration;
+        // A nested function declaration's name lives in the enclosing scope; a
+        // named function expression's name is visible only inside itself.
+        if is_decl && self.scopes.len() > 1 {
+            if let Some(id) = &it.id {
                 self.scope_mut().insert(id.name.to_string(), Binding::LocalOther);
             }
         }
-        self.push_fn_scope(&it.params);
+        let stmts = it.body.as_deref().map(|b| &b.statements[..]);
+        self.push_fn_scope(&it.params, it.type_parameters.as_deref(), stmts);
+        if !is_decl {
+            if let Some(id) = &it.id {
+                self.scope_mut().insert(id.name.to_string(), Binding::LocalOther);
+            }
+        }
         for p in &it.params.items {
             if let Some(init) = &p.initializer {
                 self.visit_expression(init);
@@ -802,18 +1092,18 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
         if let Some(b) = &it.body {
             self.visit_function_body(b);
         }
-        self.scopes.pop();
+        self.pop_fn_scope();
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
-        self.push_fn_scope(&it.params);
+        self.push_fn_scope(&it.params, it.type_parameters.as_deref(), Some(&it.body.statements[..]));
         for p in &it.params.items {
             if let Some(init) = &p.initializer {
                 self.visit_expression(init);
             }
         }
         self.visit_function_body(&it.body);
-        self.scopes.pop();
+        self.pop_fn_scope();
     }
 
     fn visit_variable_declarator(&mut self, it: &VariableDeclarator<'a>) {
@@ -823,6 +1113,11 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
             if self.scopes.len() > 1 {
                 let is_const = it.kind == VariableDeclarationKind::Const;
                 let b = classify_declarator(it, is_const, id.name.as_str(), false, self.src, &[0], None);
+                // Strip annotations that reference locally-shadowed type names.
+                let b = match b {
+                    Binding::Const { ann, lit } => Binding::Const { ann: self.safe_ann(ann), lit },
+                    other => other,
+                };
                 self.scope_mut().insert(id.name.to_string(), b);
             }
         } else {
@@ -839,8 +1134,17 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
         match &it.callee {
             Expression::Identifier(id) => match self.lookup(id.name.as_str()) {
                 Some(Binding::Fn) => self.record_call(UsageTargetRef::Local { owner: Owner::Free, name: id.name.to_string() }, it),
-                Some(Binding::Import) => self.record_call(UsageTargetRef::Imported { local: id.name.to_string(), name: String::new() }, it),
-                _ => {}
+                Some(Binding::Import) => self.record_call(UsageTargetRef::Imported { local: id.name.to_string() }, it),
+                Some(Binding::Namespace) => {
+                    // Calling the namespace object itself: not a member call we
+                    // model; escape everything it exports.
+                    self.escape(UsageTargetRef::AllExportsOfModule { ns_local: id.name.to_string() });
+                }
+                _ => {
+                    // Unattributable identifier call (shadowed, unbound, or a
+                    // plain value): could reach any same-named free function.
+                    self.escape(UsageTargetRef::AnyFreeNamed(id.name.to_string()));
+                }
             },
             Expression::StaticMemberExpression(m) => {
                 let prop = m.property.name.to_string();
@@ -854,20 +1158,30 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
                             let owner = Owner::Class(cls.clone());
                             self.record_call(UsageTargetRef::Local { owner, name: prop }, it);
                         }
+                        Some(Binding::Namespace) => {
+                            self.record_call(
+                                UsageTargetRef::NamespaceMember { ns_local: obj.name.to_string(), name: prop },
+                                it,
+                            );
+                        }
                         Some(Binding::EnumDecl) => {}
                         Some(Binding::Fn) | Some(Binding::Import) => {
                             // Function used as an object (`send.call(...)` etc.).
-                            self.escape(UsageTargetRef::Local { owner: Owner::Free, name: obj.name.to_string() });
+                            self.escape_identifier_use(obj.name.as_str());
                             self.escape(UsageTargetRef::AnyMethodNamed(prop));
                         }
                         _ => {
-                            // Unattributable method call: every method with this
-                            // name must be considered escaped.
-                            self.escape(UsageTargetRef::AnyMethodNamed(prop));
+                            // Unattributable method call: could hit any method
+                            // with this name, or a free function reached via an
+                            // untracked namespace-like object (dynamic import,
+                            // required module, …).
+                            self.escape(UsageTargetRef::AnyMethodNamed(prop.clone()));
+                            self.escape(UsageTargetRef::AnyFreeNamed(prop));
                         }
                     }
                 } else {
-                    self.escape(UsageTargetRef::AnyMethodNamed(prop));
+                    self.escape(UsageTargetRef::AnyMethodNamed(prop.clone()));
+                    self.escape(UsageTargetRef::AnyFreeNamed(prop));
                     self.visit_expression(&m.object);
                 }
             }
@@ -907,57 +1221,93 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
         let prop = it.property.name.to_string();
         if let Expression::Identifier(obj) = &it.object {
             match self.lookup(obj.name.as_str()) {
-                Some(Binding::Fn) => self.escape(UsageTargetRef::Local { owner: Owner::Free, name: obj.name.to_string() }),
-                Some(Binding::Import) => self.escape(UsageTargetRef::Imported { local: obj.name.to_string(), name: String::new() }),
+                Some(Binding::Fn) | Some(Binding::Import) | Some(Binding::Namespace) => {
+                    self.escape_identifier_use(obj.name.as_str());
+                }
                 Some(Binding::ObjectConst) => {
                     self.escape(UsageTargetRef::Local { owner: Owner::ObjectConst(obj.name.to_string()), name: prop });
                 }
                 Some(Binding::Instance(cls)) => {
-                    self.escape(UsageTargetRef::Local { owner: Owner::Class(cls.clone()), name: prop });
+                    let cls = cls.clone();
+                    self.escape(UsageTargetRef::Local { owner: Owner::Class(cls), name: prop });
                 }
                 Some(Binding::EnumDecl) => {}
-                _ => self.escape(UsageTargetRef::AnyMethodNamed(prop)),
+                _ => {
+                    self.escape(UsageTargetRef::AnyMethodNamed(prop.clone()));
+                    self.escape(UsageTargetRef::AnyFreeNamed(prop));
+                }
             }
         } else {
-            self.escape(UsageTargetRef::AnyMethodNamed(prop));
+            self.escape(UsageTargetRef::AnyMethodNamed(prop.clone()));
+            self.escape(UsageTargetRef::AnyFreeNamed(prop));
             self.visit_expression(&it.object);
         }
     }
 
     fn visit_jsx_opening_element(&mut self, it: &JSXOpeningElement<'a>) {
-        if let JSXElementName::IdentifierReference(id) = &it.name {
-            let target = match self.lookup(id.name.as_str()) {
-                Some(Binding::Fn) => Some(UsageTargetRef::Local { owner: Owner::Free, name: id.name.to_string() }),
-                Some(Binding::Import) => Some(UsageTargetRef::Imported { local: id.name.to_string(), name: String::new() }),
-                _ => None,
-            };
-            if let Some(target) = target {
-                let mut opaque = false;
-                let mut props: Vec<(String, Observed)> = Vec::new();
-                for attr in &it.attributes {
-                    match attr {
-                        JSXAttributeItem::SpreadAttribute(_) => opaque = true,
-                        JSXAttributeItem::Attribute(a) => {
-                            let JSXAttributeName::Identifier(name) = &a.name else {
-                                opaque = true;
-                                continue;
-                            };
-                            let obs = match &a.value {
-                                None => Observed::BoolLit(true),
-                                Some(JSXAttributeValue::StringLiteral(s)) => Observed::StrLit(s.value.to_string()),
-                                Some(JSXAttributeValue::ExpressionContainer(c)) => match c.expression.as_expression() {
-                                    Some(e) => self.expr_to_observed(e),
-                                    None => Observed::Opaque,
-                                },
-                                Some(_) => Observed::Opaque,
-                            };
-                            props.push((name.name.to_string(), obs));
+        match &it.name {
+            JSXElementName::IdentifierReference(id) => {
+                let target = match self.lookup(id.name.as_str()) {
+                    Some(Binding::Fn) => Some(UsageTargetRef::Local { owner: Owner::Free, name: id.name.to_string() }),
+                    Some(Binding::Import) => Some(UsageTargetRef::Imported { local: id.name.to_string() }),
+                    Some(Binding::ClassDecl) => {
+                        // Class components are unmodeled; props flow somewhere
+                        // we don't track.
+                        self.escape(UsageTargetRef::AllMembersOf(Owner::Class(id.name.to_string())));
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    let mut opaque = false;
+                    let mut props: Vec<(String, Observed)> = Vec::new();
+                    for attr in &it.attributes {
+                        match attr {
+                            JSXAttributeItem::SpreadAttribute(_) => opaque = true,
+                            JSXAttributeItem::Attribute(a) => {
+                                let JSXAttributeName::Identifier(name) = &a.name else {
+                                    opaque = true;
+                                    continue;
+                                };
+                                let obs = match &a.value {
+                                    None => Observed::BoolLit(true),
+                                    Some(JSXAttributeValue::StringLiteral(s)) => Observed::StrLit(s.value.to_string()),
+                                    Some(JSXAttributeValue::ExpressionContainer(c)) => match c.expression.as_expression() {
+                                        Some(e) => self.expr_to_observed(e, 0),
+                                        None => Observed::Opaque,
+                                    },
+                                    Some(_) => Observed::Opaque,
+                                };
+                                props.push((name.name.to_string(), obs));
+                            }
                         }
                     }
+                    let args = if opaque { CallArgs::Opaque } else { CallArgs::Args(vec![Observed::Object(props)]) };
+                    let line = line_of(self.line_starts, it.span.start);
+                    self.usages.push(Usage { target, kind: UsageKind::Call(args), line });
                 }
-                let args = if opaque { CallArgs::Opaque } else { CallArgs::Args(vec![Observed::Object(props)]) };
-                self.usages.push(Usage { target, kind: UsageKind::Call(args) });
             }
+            JSXElementName::MemberExpression(m) => {
+                // <UI.Badge .../>: unattributable component reference — escape
+                // by member name, and escape the base object if we track it.
+                self.escape(UsageTargetRef::AnyMethodNamed(m.property.name.to_string()));
+                let mut obj = &m.object;
+                loop {
+                    match obj {
+                        JSXMemberExpressionObject::IdentifierReference(id) => {
+                            let name = id.name.to_string();
+                            self.escape_identifier_use(&name);
+                            break;
+                        }
+                        JSXMemberExpressionObject::MemberExpression(inner) => {
+                            self.escape(UsageTargetRef::AnyMethodNamed(inner.property.name.to_string()));
+                            obj = &inner.object;
+                        }
+                        JSXMemberExpressionObject::ThisExpression(_) => break,
+                    }
+                }
+            }
+            _ => {}
         }
         // Walk attribute values for nested usages; the tag name is consumed.
         for attr in &it.attributes {
@@ -977,13 +1327,6 @@ impl<'a> Visit<'a> for UsageVisitor<'_> {
     fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
         // Any identifier that reaches the default visitor is in a non-call,
         // non-neutral position.
-        match self.lookup(it.name.as_str()) {
-            Some(Binding::Fn) => self.escape(UsageTargetRef::Local { owner: Owner::Free, name: it.name.to_string() }),
-            Some(Binding::Import) => self.escape(UsageTargetRef::Imported { local: it.name.to_string(), name: String::new() }),
-            Some(Binding::ObjectConst) => self.escape(UsageTargetRef::AllMembersOf(Owner::ObjectConst(it.name.to_string()))),
-            Some(Binding::Instance(cls)) => self.escape(UsageTargetRef::AllMembersOf(Owner::Class(cls.clone()))),
-            Some(Binding::ClassDecl) => self.escape(UsageTargetRef::AllMembersOf(Owner::Class(it.name.to_string()))),
-            _ => {}
-        }
+        self.escape_identifier_use(it.name.as_str());
     }
 }
