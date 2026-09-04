@@ -201,6 +201,15 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
         for u in &m.usages {
             let resolved: Resolved = match &u.target {
                 UsageTargetRef::Local { owner: Owner::Free, name } => {
+                    // Fast path: same-module declaration (the overwhelmingly
+                    // common case) needs no re-export chase.
+                    if let Some(&ti) = decl_index.get(&(mid, Owner::Free, name.clone())) {
+                        match &u.kind {
+                            UsageKind::Call(args) => states[ti].calls.push((mid, u.line, args.clone())),
+                            UsageKind::Escape => states[ti].escaped = true,
+                        }
+                        continue;
+                    }
                     let mut visited = HashSet::new();
                     match resolve_free(mid, name, &modules, &by_path, &decl_index, &mut visited) {
                         FreeLookup::Found(ti) => Resolved::One(ti),
@@ -235,6 +244,15 @@ pub fn analyze(root: &Path, opts: &Options) -> Result<(Vec<Finding>, Stats), Str
                 UsageTargetRef::Imported { local } => match modules[mid].imports.get(local) {
                     Some((Some(path), imported)) => match by_path.get(path) {
                         Some(&mid2) => {
+                            if imported != "default" {
+                                if let Some(&ti) = decl_index.get(&(mid2, Owner::Free, imported.clone())) {
+                                    match &u.kind {
+                                        UsageKind::Call(args) => states[ti].calls.push((mid, u.line, args.clone())),
+                                        UsageKind::Escape => states[ti].escaped = true,
+                                    }
+                                    continue;
+                                }
+                            }
                             let mut visited = HashSet::new();
                             match resolve_free(mid2, imported, &modules, &by_path, &decl_index, &mut visited) {
                                 FreeLookup::Found(ti) => Resolved::One(ti),
