@@ -89,8 +89,11 @@ a real call), `const m = await import("./x")`, re-export chains
 `name` fields found under the analysis root).
 
 A function is skipped entirely when analysis would be unsound for it:
-any reference outside callee position, overloads, generics, rest parameters,
-destructured parameters. Scope handling is function-granular: every name
+any reference outside callee position, overloads, generics, rest parameters.
+Destructured object parameters are analyzed against their annotation
+(`function Badge({ variant }: BadgeProps)` reports per-property paths), and
+each destructured name binds to a property projection of the annotation, so a
+forwarded prop narrows its callee too; array-pattern parameters are opaque. Scope handling is function-granular: every name
 declared anywhere in a function body shadows outer scopes for the whole
 function, so block-scoped shadowing degrades to escapes/opaque observations
 rather than wrong bindings; annotations mentioning function-local type
@@ -109,7 +112,7 @@ the one place the guarantee is knowingly best-effort).
   `workspace.rs` (tsconfig paths + workspace package names), `link.rs`
   (cross-module linking + taints + orchestration), `resolve.rs` (memoized type
   resolution), `narrow.rs` (the narrowing core), `diff.rs`, `genproj.rs`.
-- `fixture/` — a handcrafted TypeScript project with 25 cases (including
+- `fixture/` — a handcrafted TypeScript project with 26 cases (including
   regression cases for barrel files, default/namespace imports, shadowing,
   local type shadowing, subsumed constituents, dotted filenames, JSX member
   tags) and ground truth in `fixture/expected.json`; `npm run check:fixture`

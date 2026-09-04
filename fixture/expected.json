@@ -27,6 +27,10 @@
     { "file": "src/19-barrel-def.ts", "function": "relay", "param": "c", "path": "", "unused": ["\"r3\""] },
     { "file": "src/20-default-def.ts", "function": "dflt", "param": "m", "path": "", "unused": ["\"d2\"", "\"d3\""] },
     { "file": "src/20-ns-def.ts", "function": "nsfn", "param": "m", "path": "", "unused": ["\"n3\""] },
-    { "file": "src/24-dotted.service.ts", "function": "dsend", "param": "c", "path": "", "unused": ["\"s3\""] }
+    { "file": "src/24-dotted.service.ts", "function": "dsend", "param": "c", "path": "", "unused": ["\"s3\""] },
+    { "file": "src/26-destructured.tsx", "function": "Chip", "param": "{tone, size}", "path": ".tone", "unused": ["\"t3\""] },
+    { "file": "src/26-destructured.tsx", "function": "Chip", "param": "{tone, size}", "path": ".size", "unused": ["\"m\"", "\"l\""] },
+    { "file": "src/26-destructured.tsx", "function": "pinner", "param": "t", "path": "", "unused": ["\"p3\""] },
+    { "file": "src/26-destructured.tsx", "function": "qinner", "param": "lv", "path": "", "unused": ["9"] }
   ]
 }

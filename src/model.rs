@@ -23,6 +23,12 @@ pub enum TypeExpr {
     Any,
     Unknown,
     ObjectLit(Vec<ObjProp>),
+    /// Property projection: the type of `base[prop]`, used for destructured
+    /// parameter bindings (`{ variant }: BadgeProps` binds `variant` to
+    /// `Proj(BadgeProps, "variant")`). Only ever feeds OBSERVED types — its
+    /// unresolvable fallback is AnyLike (wide), which is safe for observations
+    /// and would be unsound for declared types.
+    Proj(Box<TypeExpr>, String),
     /// Anything we do not model (generics, arrays, functions, mapped types, …).
     /// Carries the source text for display. Never matches anything.
     Opaque(String),

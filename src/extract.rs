@@ -602,10 +602,30 @@ fn simple_literal(e: &Expression) -> Option<Observed> {
 }
 
 fn params_eligible(params: &FormalParameters) -> bool {
-    if params.rest.is_some() || params.items.is_empty() {
-        return false;
+    // Rest params shift nothing before them but complicate omitted-arg logic;
+    // functions carrying one stay skipped. Destructured params are fine: an
+    // object pattern analyzes against its annotation, an array pattern simply
+    // yields no declared type for that position.
+    !(params.rest.is_some() || params.items.is_empty())
+}
+
+/// Display name for a parameter position.
+fn pattern_display(p: &BindingPattern) -> String {
+    match p {
+        BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+        BindingPattern::ObjectPattern(o) => {
+            let mut names: Vec<String> = Vec::new();
+            for prop in o.properties.iter().take(3) {
+                if let PropertyKey::StaticIdentifier(k) = &prop.key {
+                    names.push(k.name.to_string());
+                }
+            }
+            let ellipsis = if o.properties.len() > 3 || o.rest.is_some() { ", …" } else { "" };
+            format!("{{{}{}}}", names.join(", "), ellipsis)
+        }
+        BindingPattern::ArrayPattern(_) => "[…]".to_string(),
+        BindingPattern::AssignmentPattern(ap) => pattern_display(&ap.left),
     }
-    params.items.iter().all(|p| matches!(p.pattern, BindingPattern::BindingIdentifier(_)))
 }
 
 fn extract_params(params: &FormalParameters, src: &str) -> Vec<ParamInfo> {
@@ -613,26 +633,60 @@ fn extract_params(params: &FormalParameters, src: &str) -> Vec<ParamInfo> {
         .items
         .iter()
         .map(|p| {
-            let name = match &p.pattern {
-                BindingPattern::BindingIdentifier(id) => id.name.to_string(),
-                _ => "<pattern>".to_string(),
-            };
+            let name = pattern_display(&p.pattern);
+            // Array patterns have no analyzable declared shape (tuples are
+            // opaque in our IR); object patterns and identifiers use the
+            // annotation as-is.
+            let analyzable = !matches!(p.pattern, BindingPattern::ArrayPattern(_));
             let (ty, ty_text) = match &p.type_annotation {
-                Some(t) => (
+                Some(t) if analyzable => (
                     Some(ts_type_to_expr(&t.type_annotation, src, 0)),
                     Some(span_text(src, t.type_annotation.span()).to_string()),
                 ),
-                None => (None, None),
+                _ => (None, None),
             };
             ParamInfo {
                 name,
                 ty,
                 ty_text,
                 optional: p.optional,
-                default: p.initializer.as_ref().map(|e| simple_literal(e).unwrap_or(Observed::Opaque)),
+                default: p.initializer.as_ref().map(|e| literal_observed(e, 0).unwrap_or(Observed::Opaque)),
             }
         })
         .collect()
+}
+
+/// Scope-free literal extraction, safe for parameter defaults: the default is
+/// evaluated fresh at call entry, so a nested object literal is exactly the
+/// value observed. (NOT safe for const bindings — a const *object* can be
+/// mutated between its declaration and a later call.)
+fn literal_observed(e: &Expression, depth: usize) -> Option<Observed> {
+    if depth > TYPE_DEPTH_LIMIT {
+        return None;
+    }
+    if let Some(l) = simple_literal(e) {
+        return Some(l);
+    }
+    match e {
+        Expression::Identifier(id) if id.name == "undefined" => Some(Observed::Undefined),
+        Expression::ObjectExpression(o) => {
+            let mut props = Vec::new();
+            for p in &o.properties {
+                let ObjectPropertyKind::ObjectProperty(prop) = p else { return None };
+                if prop.computed {
+                    return None;
+                }
+                let name = match &prop.key {
+                    PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                    PropertyKey::StringLiteral(s) => s.value.to_string(),
+                    _ => return None,
+                };
+                props.push((name, literal_observed(&prop.value, depth + 1)?));
+            }
+            Some(Observed::Object(props))
+        }
+        _ => None,
+    }
 }
 
 fn signatures_to_object(members: &[TSSignature], src: &str, depth: usize) -> TypeExpr {
@@ -703,6 +757,7 @@ fn collect_refs<'a>(te: &'a TypeExpr, out: &mut Vec<&'a str>) {
         TypeExpr::Ref(n) => out.push(n),
         TypeExpr::Union(parts) => parts.iter().for_each(|p| collect_refs(p, out)),
         TypeExpr::ObjectLit(props) => props.iter().for_each(|p| collect_refs(&p.ty, out)),
+        TypeExpr::Proj(base, _) => collect_refs(base, out),
         _ => {}
     }
 }
@@ -809,6 +864,47 @@ fn scan_stmt(stmt: &Statement, values: &mut HashMap<String, Binding>, types: &mu
     }
 }
 
+/// Bind the names of a destructured object parameter to property projections
+/// of `base`. Anything we can't project (computed keys, array patterns) falls
+/// back to opaque local bindings.
+fn bind_object_projections(o: &ObjectPattern, base: &TypeExpr, scope: &mut HashMap<String, Binding>) {
+    for prop in &o.properties {
+        let key = if prop.computed {
+            None
+        } else {
+            match &prop.key {
+                PropertyKey::StaticIdentifier(k) => Some(k.name.to_string()),
+                PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+                _ => None,
+            }
+        };
+        match key {
+            Some(key) => {
+                let proj = TypeExpr::Proj(Box::new(base.clone()), key);
+                bind_pattern_projection(&prop.value, proj, scope);
+            }
+            None => bind_pattern_names(&prop.value, scope),
+        }
+    }
+    if let Some(rest) = &o.rest {
+        bind_pattern_names(&rest.argument, scope);
+    }
+}
+
+fn bind_pattern_projection(p: &BindingPattern, ty: TypeExpr, scope: &mut HashMap<String, Binding>) {
+    match p {
+        BindingPattern::BindingIdentifier(id) => {
+            scope.insert(id.name.to_string(), Binding::Param { ann: Some(ty) });
+        }
+        BindingPattern::ObjectPattern(o) => bind_object_projections(o, &ty, scope),
+        // A default only removes undefined from the runtime value; the
+        // projection (which may include undefined) is wider — safe for
+        // observations.
+        BindingPattern::AssignmentPattern(ap) => bind_pattern_projection(&ap.left, ty, scope),
+        BindingPattern::ArrayPattern(_) => bind_pattern_names(p, scope),
+    }
+}
+
 fn bind_pattern_names(p: &BindingPattern, scope: &mut HashMap<String, Binding>) {
     match p {
         BindingPattern::BindingIdentifier(id) => {
@@ -890,18 +986,25 @@ impl UsageVisitor<'_> {
         // beats a same-named inner declaration until the declarator re-inserts.
         self.type_shadows.push(types);
         for p in &params.items {
-            if let BindingPattern::BindingIdentifier(id) = &p.pattern {
-                let ann = p.type_annotation.as_ref().map(|t| ts_type_to_expr(&t.type_annotation, self.src, 0));
-                let ann = ann.filter(|t| {
-                    let mut refs = Vec::new();
-                    collect_refs(t, &mut refs);
-                    !refs
-                        .iter()
-                        .any(|n| self.type_shadows.iter().any(|s| s.contains(*n)))
-                });
-                scope.insert(id.name.to_string(), Binding::Param { ann });
-            } else {
-                bind_pattern_names(&p.pattern, &mut scope);
+            let ann = p.type_annotation.as_ref().map(|t| ts_type_to_expr(&t.type_annotation, self.src, 0));
+            let ann = ann.filter(|t| {
+                let mut refs = Vec::new();
+                collect_refs(t, &mut refs);
+                !refs
+                    .iter()
+                    .any(|n| self.type_shadows.iter().any(|s| s.contains(*n)))
+            });
+            match (&p.pattern, ann) {
+                (BindingPattern::BindingIdentifier(id), ann) => {
+                    scope.insert(id.name.to_string(), Binding::Param { ann });
+                }
+                // Destructured object parameter: each name binds to a property
+                // projection of the annotation, so forwarding a prop into
+                // another call narrows that callee too.
+                (BindingPattern::ObjectPattern(o), Some(base)) => {
+                    bind_object_projections(o, &base, &mut scope);
+                }
+                (other, _) => bind_pattern_names(other, &mut scope),
             }
         }
         self.scopes.push(scope);

@@ -89,6 +89,10 @@ impl<'m> Resolver<'m> {
             TypeExpr::Undefined => Ty::Undefined,
             TypeExpr::Null => Ty::Null,
             TypeExpr::Any | TypeExpr::Unknown => Ty::AnyLike,
+            TypeExpr::Proj(base, prop) => {
+                let base = self.resolve_inner(base, mid, stack);
+                project(&base, prop)
+            }
             TypeExpr::Opaque(s) => Ty::Opaque(s.clone()),
         }
     }
@@ -218,6 +222,41 @@ impl<'m> Resolver<'m> {
             ),
             Observed::Opaque => Ty::AnyLike,
         }
+    }
+}
+
+/// The type of `base[prop]`. This feeds observed types only, so every
+/// unresolvable case falls back to AnyLike (covers everything — safe for
+/// observations, which can only mark constituents as used).
+fn project(base: &Ty, prop: &str) -> Ty {
+    match base {
+        Ty::Object(props) => match props.iter().find(|p| p.name == prop) {
+            Some(p) if p.optional => match &p.ty {
+                Ty::Union(parts) => {
+                    let mut parts = parts.clone();
+                    if !parts.contains(&Ty::Undefined) {
+                        parts.push(Ty::Undefined);
+                    }
+                    Ty::Union(parts)
+                }
+                other => Ty::Union(vec![other.clone(), Ty::Undefined]),
+            },
+            Some(p) => p.ty.clone(),
+            None => Ty::AnyLike,
+        },
+        Ty::Union(parts) => {
+            let mut out: Vec<Ty> = Vec::new();
+            for part in parts {
+                match project(part, prop) {
+                    Ty::AnyLike => return Ty::AnyLike,
+                    Ty::Union(inner) => out.extend(inner),
+                    t => out.push(t),
+                }
+            }
+            dedupe(&mut out);
+            Ty::Union(out)
+        }
+        _ => Ty::AnyLike,
     }
 }
 
