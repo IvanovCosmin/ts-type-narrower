@@ -2,14 +2,14 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use overwide::{analyze, Options};
+use type_narrower::{analyze, Options};
 
 const USAGE: &str = "\
-overwide — find function parameters declared wider than any call site uses
+type-narrower — find function parameters declared wider than any call site uses
 
 USAGE:
-  overwide <dir|file> [OPTIONS]
-  overwide gen --out <dir> [--files N] [--fns N] [--seed N]
+  type-narrower <dir|file> [OPTIONS]
+  type-narrower gen --out <dir> [--files N] [--fns N] [--seed N]
 
 OPTIONS:
   --diff <base>        Only report functions touched by `git diff <base>`.
@@ -29,7 +29,7 @@ EXIT CODES:
   2  usage, IO, or git error
 ";
 
-/// Print, ignoring broken-pipe (e.g. `overwide dir | head`).
+/// Print, ignoring broken-pipe (e.g. `type-narrower dir | head`).
 macro_rules! outln {
     ($h:expr, $($arg:tt)*) => {
         if writeln!($h, $($arg)*).is_err() {
@@ -45,11 +45,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("overwide {}", env!("CARGO_PKG_VERSION"));
+        println!("type-narrower {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
     if args[0] == "gen" {
-        return match overwide_gen(&args[1..]) {
+        return match type_narrower_gen(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -161,13 +161,13 @@ fn main() -> ExitCode {
     // Soundness warnings print regardless of --quiet — they are the signals
     // that findings may be unreliable.
     for w in &res.warnings {
-        eprintln!("overwide: WARNING: {w}");
+        eprintln!("type-narrower: WARNING: {w}");
     }
     if !opts.quiet {
         let stats = &res.stats;
         let pct = |n: usize| if stats.decls == 0 { 0.0 } else { n as f64 * 100.0 / stats.decls as f64 };
         eprintln!(
-            "overwide: {} files, {} functions — analyzed {} ({:.0}%), escaped {} ({:.0}%), never-called {} ({:.0}%), generic {}, overloaded {}, rest-param {}, zero-param {}; {} finding(s)",
+            "type-narrower: {} files, {} functions — analyzed {} ({:.0}%), escaped {} ({:.0}%), never-called {} ({:.0}%), generic {}, overloaded {}, rest-param {}, zero-param {}; {} finding(s)",
             stats.files,
             stats.decls,
             stats.analyzed,
@@ -189,8 +189,8 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `overwide gen`: emit a synthetic project for benchmarking.
-fn overwide_gen(args: &[String]) -> Result<(), String> {
+/// `type-narrower gen`: emit a synthetic project for benchmarking.
+fn type_narrower_gen(args: &[String]) -> Result<(), String> {
     let mut out: Option<PathBuf> = None;
     let mut files = 1000usize;
     let mut fns = 10usize;
@@ -219,5 +219,5 @@ fn overwide_gen(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let out = out.ok_or("gen requires --out <dir>")?;
-    overwide::genproj::generate(&out, files, fns, seed)
+    type_narrower::genproj::generate(&out, files, fns, seed)
 }

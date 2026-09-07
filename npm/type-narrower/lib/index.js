@@ -11,12 +11,12 @@ const path = require("node:path");
 function platformPackage() {
   const { platform, arch } = process;
   if (platform === "linux" && arch === "x64") {
-    return isMusl() ? "overwide-linux-x64-musl" : "overwide-linux-x64";
+    return isMusl() ? "type-narrower-linux-x64-musl" : "type-narrower-linux-x64";
   }
-  if (platform === "linux" && arch === "arm64") return "overwide-linux-arm64";
-  if (platform === "darwin" && arch === "x64") return "overwide-darwin-x64";
-  if (platform === "darwin" && arch === "arm64") return "overwide-darwin-arm64";
-  if (platform === "win32" && arch === "x64") return "overwide-win32-x64";
+  if (platform === "linux" && arch === "arm64") return "type-narrower-linux-arm64";
+  if (platform === "darwin" && arch === "x64") return "type-narrower-darwin-x64";
+  if (platform === "darwin" && arch === "arm64") return "type-narrower-darwin-arm64";
+  if (platform === "win32" && arch === "x64") return "type-narrower-win32-x64";
   return null;
 }
 
@@ -31,15 +31,15 @@ function isMusl() {
 }
 
 /**
- * Absolute path to the overwide binary for this platform.
- * Resolution order: OVERWIDE_BINARY env var, then the installed platform
+ * Absolute path to the type-narrower binary for this platform.
+ * Resolution order: TYPE_NARROWER_BINARY env var, then the installed platform
  * package. Throws with an actionable message when neither is available.
  */
 function binaryPath() {
-  const override = process.env.OVERWIDE_BINARY;
+  const override = process.env.TYPE_NARROWER_BINARY;
   if (override) {
     if (!fs.existsSync(override)) {
-      throw new Error(`OVERWIDE_BINARY points to a missing file: ${override}`);
+      throw new Error(`TYPE_NARROWER_BINARY points to a missing file: ${override}`);
     }
     return override;
   }
@@ -47,19 +47,19 @@ function binaryPath() {
   const pkg = platformPackage();
   if (!pkg) {
     throw new Error(
-      `overwide: unsupported platform ${process.platform}-${process.arch}. ` +
-        `Build from source (cargo build --release) and set OVERWIDE_BINARY.`
+      `type-narrower: unsupported platform ${process.platform}-${process.arch}. ` +
+        `Build from source (cargo build --release) and set TYPE_NARROWER_BINARY.`
     );
   }
 
-  const exe = process.platform === "win32" ? "overwide.exe" : "overwide";
+  const exe = process.platform === "win32" ? "type-narrower.exe" : "type-narrower";
   try {
     return require.resolve(`${pkg}/bin/${exe}`);
   } catch {
     throw new Error(
-      `overwide: platform package "${pkg}" is not installed. ` +
+      `type-narrower: platform package "${pkg}" is not installed. ` +
         `Reinstall dependencies (optionalDependencies must not be disabled), ` +
-        `or set OVERWIDE_BINARY to a locally built binary.`
+        `or set TYPE_NARROWER_BINARY to a locally built binary.`
     );
   }
 }
@@ -88,14 +88,14 @@ function analyze(root, options = {}) {
   });
 
   if (res.error) {
-    throw new Error(`overwide: failed to spawn ${bin}: ${res.error.message}`);
+    throw new Error(`type-narrower: failed to spawn ${bin}: ${res.error.message}`);
   }
   // --quiet suppresses only the summary line; anything left on stderr is a
   // soundness warning (parse errors, unreadable files, sub-root analysis).
   if (res.stderr) process.stderr.write(res.stderr);
   if (res.status !== 0) {
     throw new Error(
-      `overwide exited with code ${res.status}:\n${res.stderr || res.stdout}`
+      `type-narrower exited with code ${res.status}:\n${res.stderr || res.stdout}`
     );
   }
   return JSON.parse(res.stdout);

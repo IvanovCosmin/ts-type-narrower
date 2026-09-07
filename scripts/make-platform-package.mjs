@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Generate one platform npm package (e.g. overwide-linux-x64) around a built
+// Generate one platform npm package (e.g. type-narrower-linux-x64) around a built
 // binary. Used by the release workflow and by local testing.
 //
 //   node scripts/make-platform-package.mjs <pkg-name> <binary-path> <out-dir>
@@ -15,12 +15,12 @@ if (!pkgName || !binaryPath || !outDir) {
 }
 
 const PLATFORMS = {
-  "overwide-linux-x64": { os: "linux", cpu: "x64", libc: "glibc" },
-  "overwide-linux-x64-musl": { os: "linux", cpu: "x64", libc: "musl" },
-  "overwide-linux-arm64": { os: "linux", cpu: "arm64", libc: "glibc" },
-  "overwide-darwin-x64": { os: "darwin", cpu: "x64" },
-  "overwide-darwin-arm64": { os: "darwin", cpu: "arm64" },
-  "overwide-win32-x64": { os: "win32", cpu: "x64" },
+  "type-narrower-linux-x64": { os: "linux", cpu: "x64", libc: "glibc" },
+  "type-narrower-linux-x64-musl": { os: "linux", cpu: "x64", libc: "musl" },
+  "type-narrower-linux-arm64": { os: "linux", cpu: "arm64", libc: "glibc" },
+  "type-narrower-darwin-x64": { os: "darwin", cpu: "x64" },
+  "type-narrower-darwin-arm64": { os: "darwin", cpu: "arm64" },
+  "type-narrower-win32-x64": { os: "win32", cpu: "x64" },
 };
 
 const meta = PLATFORMS[pkgName];
@@ -31,10 +31,10 @@ if (!meta) {
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { version } = JSON.parse(
-  fs.readFileSync(path.join(repoRoot, "npm/overwide/package.json"), "utf8")
+  fs.readFileSync(path.join(repoRoot, "npm/type-narrower/package.json"), "utf8")
 );
 
-const exe = meta.os === "win32" ? "overwide.exe" : "overwide";
+const exe = meta.os === "win32" ? "type-narrower.exe" : "type-narrower";
 const binDir = path.join(outDir, "bin");
 fs.mkdirSync(binDir, { recursive: true });
 fs.copyFileSync(binaryPath, path.join(binDir, exe));
@@ -43,9 +43,9 @@ if (meta.os !== "win32") fs.chmodSync(path.join(binDir, exe), 0o755);
 const pkg = {
   name: pkgName,
   version,
-  description: `overwide binary for ${meta.os}-${meta.cpu}${meta.libc === "musl" ? " (musl)" : ""}`,
+  description: `type-narrower binary for ${meta.os}-${meta.cpu}${meta.libc === "musl" ? " (musl)" : ""}`,
   license: "MIT",
-  repository: { type: "git", url: "git+https://github.com/IvanovCosmin/overwide.git" },
+  repository: { type: "git", url: "git+https://github.com/IvanovCosmin/type-narrower.git" },
   os: [meta.os],
   cpu: [meta.cpu],
   files: ["bin"],
@@ -54,6 +54,6 @@ const pkg = {
 fs.writeFileSync(path.join(outDir, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
 fs.writeFileSync(
   path.join(outDir, "README.md"),
-  `# ${pkgName}\n\nPrebuilt \`overwide\` binary for ${meta.os}-${meta.cpu}. Install the [overwide](https://www.npmjs.com/package/overwide) package instead of this one.\n`
+  `# ${pkgName}\n\nPrebuilt \`type-narrower\` binary for ${meta.os}-${meta.cpu}. Install the [type-narrower](https://www.npmjs.com/package/type-narrower) package instead of this one.\n`
 );
 console.log(`wrote ${pkgName}@${version} to ${outDir}`);

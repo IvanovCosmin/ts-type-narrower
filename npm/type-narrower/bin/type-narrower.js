@@ -14,7 +14,7 @@ try {
 
 const res = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
 if (res.error) {
-  console.error(`overwide: ${res.error.message}`);
+  console.error(`type-narrower: ${res.error.message}`);
   process.exit(2);
 }
 process.exit(res.status ?? 2);

@@ -1,6 +1,6 @@
-# eslint-plugin-overwide
+# eslint-plugin-type-narrower
 
-Surfaces [overwide](https://github.com/IvanovCosmin/overwide) findings in
+Surfaces [type-narrower](https://github.com/IvanovCosmin/type-narrower) findings in
 ESLint: function parameters whose declared union types contain constituents no
 call site ever passes.
 
@@ -12,7 +12,7 @@ send("email"); send("sms"); send("push");
 // "email" | "sms" | "push" | "fax" but its 3 call site(s) never pass: "fax"
 ```
 
-The analyzer is a Rust binary (installed automatically via the `overwide`
+The analyzer is a Rust binary (installed automatically via the `type-narrower`
 package's prebuilt platform binaries). It analyzes the **whole project once
 per lint run** — closed-world, cross-module — and this plugin maps its
 findings onto each linted file. It is not a per-file AST rule; the analysis
@@ -22,7 +22,7 @@ the closed-world assumption is sound.
 ## Setup
 
 ```
-npm install -D eslint-plugin-overwide
+npm install -D eslint-plugin-type-narrower
 ```
 
 Requires a TypeScript-capable parser (you almost certainly already use
@@ -30,26 +30,26 @@ Requires a TypeScript-capable parser (you almost certainly already use
 
 ```js
 // eslint.config.js
-import overwide from "eslint-plugin-overwide";
+import type-narrower from "eslint-plugin-type-narrower";
 
 export default [
   // ...your typescript-eslint setup...
-  overwide.configs.recommended, // warns on **/*.ts,tsx,mts,cts
+  type-narrower.configs.recommended, // warns on **/*.ts,tsx,mts,cts
 ];
 ```
 
 Legacy `.eslintrc`:
 
 ```json
-{ "extends": ["plugin:overwide/recommended-legacy"] }
+{ "extends": ["plugin:type-narrower/recommended-legacy"] }
 ```
 
-## Rule: `overwide/no-overwide-parameters`
+## Rule: `type-narrower/no-wide-parameters`
 
 Options:
 
 ```js
-"overwide/no-overwide-parameters": ["warn", {
+"type-narrower/no-wide-parameters": ["warn", {
   // Analysis root. Default: the enclosing git top-level.
   projectRoot: undefined,
   // Open-world mode: skip exported functions (their callers may live
@@ -67,12 +67,12 @@ Options:
 Findings are reported at the function declaration's line. Because the
 analysis is project-wide, a warning in file A can be caused by call sites in
 file B; each analyzer finding carries up to three example call sites, which
-you can inspect by running the `overwide` CLI directly.
+you can inspect by running the `type-narrower` CLI directly.
 
 ## Soundness
 
 Everything the analyzer cannot prove degrades to *not reporting*: spread
 arguments, `as any`, unresolvable imports, overloads, generics, rest
 parameters all suppress findings rather than fabricate them. See the
-[project README](https://github.com/IvanovCosmin/overwide#the-soundness-invariant)
+[project README](https://github.com/IvanovCosmin/type-narrower#the-soundness-invariant)
 for the full contract and known limits.

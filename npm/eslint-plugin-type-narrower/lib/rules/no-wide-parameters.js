@@ -9,7 +9,7 @@ module.exports = {
     docs: {
       description:
         "Report function parameters whose declared union types contain constituents no call site ever passes",
-      url: "https://github.com/IvanovCosmin/overwide#the-rule",
+      url: "https://github.com/IvanovCosmin/type-narrower#the-rule",
     },
     schema: [
       {
@@ -38,7 +38,7 @@ module.exports = {
     messages: {
       neverPassed:
         "Parameter '{{name}}' of '{{function}}' is declared as {{declared}} but its {{callCount}} call site(s) never pass: {{unused}}.",
-      analysisFailed: "overwide analysis failed: {{message}}",
+      analysisFailed: "type-narrower analysis failed: {{message}}",
     },
   },
 

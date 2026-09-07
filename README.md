@@ -1,4 +1,4 @@
-# overwide
+# type-narrower
 
 Static analysis for TypeScript that finds function parameters whose declared
 union types are wider than anything the call sites actually pass.
@@ -18,29 +18,29 @@ bails to "no finding" on anything it cannot prove.
 
 ## ESLint plugin
 
-overwide ships as an npm package pair:
-[`eslint-plugin-overwide`](https://www.npmjs.com/package/eslint-plugin-overwide)
-(the plugin) and [`overwide`](https://www.npmjs.com/package/overwide) (the CLI
+type-narrower ships as an npm package pair:
+[`eslint-plugin-type-narrower`](https://www.npmjs.com/package/eslint-plugin-type-narrower)
+(the plugin) and [`type-narrower`](https://www.npmjs.com/package/type-narrower) (the CLI
 with prebuilt binaries per platform, pulled in automatically). The plugin runs
 the whole-project analysis once per lint run and maps findings onto each
 linted file:
 
 ```js
 // eslint.config.js
-import overwide from "eslint-plugin-overwide";
+import type-narrower from "eslint-plugin-type-narrower";
 export default [
   // ...your typescript-eslint setup...
-  overwide.configs.recommended,
+  type-narrower.configs.recommended,
 ];
 ```
 
-See `npm/eslint-plugin-overwide/README.md` for rule options
+See `npm/eslint-plugin-type-narrower/README.md` for rule options
 (`projectRoot`, `respectExports`, `cacheMs`, ...) and the legacy
 `.eslintrc` form.
 
-Releasing: bump the version in `Cargo.toml`, `npm/overwide/package.json`
+Releasing: bump the version in `Cargo.toml`, `npm/type-narrower/package.json`
 (including its optionalDependencies), and
-`npm/eslint-plugin-overwide/package.json` (including its `overwide`
+`npm/eslint-plugin-type-narrower/package.json` (including its `type-narrower`
 dependency), then push a `v<version>` tag. `.github/workflows/release.yml`
 cross-builds the six platform binaries and publishes all eight packages to
 npm; it needs an `NPM_TOKEN` repository secret (npm automation token).
@@ -49,13 +49,13 @@ npm; it needs an `NPM_TOKEN` repository secret (npm automation token).
 
 ```
 cargo build --release
-overwide <dir|file>                    # analyze every .ts/.tsx/.mts/.cts under dir
-overwide <dir> --diff 'origin/main...HEAD'
-overwide <dir> --json                  # {version, findings, stats, uncalled*, warnings}
-overwide <dir> --list-uncalled         # dead-function candidates (never called)
-overwide <dir> --fail-on-findings      # exit 1 when findings exist
-overwide <dir> --respect-exports       # open-world: skip exported functions
-overwide <dir> --max-depth N --quiet --timing --version
+type-narrower <dir|file>                    # analyze every .ts/.tsx/.mts/.cts under dir
+type-narrower <dir> --diff 'origin/main...HEAD'
+type-narrower <dir> --json                  # {version, findings, stats, uncalled*, warnings}
+type-narrower <dir> --list-uncalled         # dead-function candidates (never called)
+type-narrower <dir> --fail-on-findings      # exit 1 when findings exist
+type-narrower <dir> --respect-exports       # open-world: skip exported functions
+type-narrower <dir> --max-depth N --quiet --timing --version
 ```
 
 Exit codes: 0 = ran (findings or not); 1 = findings with `--fail-on-findings`;
@@ -166,7 +166,7 @@ the one place the guarantee is knowingly best-effort).
   local type shadowing, subsumed constituents, dotted filenames, JSX member
   tags) and ground truth in `fixture/expected.json`; `npm run check:fixture`
   typechecks it with real tsc. `cargo test` asserts exact agreement.
-- `overwide gen --out <dir> --files N --fns M` — deterministic synthetic
+- `type-narrower gen --out <dir> --files N --fns M` — deterministic synthetic
   project generator; it prints the finding count the analyzer must reproduce.
 
 ## Performance

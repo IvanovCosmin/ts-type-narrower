@@ -1,5 +1,5 @@
 [package]
-name = "overwide"
+name = "type-narrower"
 version = "0.1.0"
 edition = "2024"
 

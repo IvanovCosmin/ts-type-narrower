@@ -1,22 +1,22 @@
 {
-  "name": "eslint-plugin-overwide",
+  "name": "eslint-plugin-type-narrower",
   "version": "0.1.0",
-  "description": "ESLint plugin surfacing overwide findings: function parameters whose declared union types are wider than anything the call sites actually pass.",
+  "description": "ESLint plugin surfacing type-narrower findings: function parameters whose declared union types are wider than anything the call sites actually pass.",
   "keywords": ["eslint", "eslintplugin", "eslint-plugin", "typescript", "union-types", "static-analysis"],
   "license": "MIT",
   "author": "Cosmin Ivanov",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/IvanovCosmin/overwide.git"
+    "url": "git+https://github.com/IvanovCosmin/type-narrower.git"
   },
-  "homepage": "https://github.com/IvanovCosmin/overwide#readme",
+  "homepage": "https://github.com/IvanovCosmin/type-narrower#readme",
   "main": "lib/index.js",
   "files": ["lib"],
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "overwide": "0.1.0"
+    "type-narrower": "0.1.0"
   },
   "peerDependencies": {
     "eslint": ">=8.57.0"

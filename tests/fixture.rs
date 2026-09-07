@@ -31,7 +31,7 @@ fn fixture_matches_expected() {
     let expected: Expected =
         serde_json::from_str(&std::fs::read_to_string(root.join("expected.json")).unwrap()).unwrap();
 
-    let findings = overwide::analyze(&root, &overwide::Options::default()).unwrap().findings;
+    let findings = type_narrower::analyze(&root, &type_narrower::Options::default()).unwrap().findings;
 
     let got: BTreeSet<String> = findings
         .iter()
@@ -56,8 +56,8 @@ fn fixture_matches_expected() {
 #[test]
 fn respect_exports_drops_exported() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixture");
-    let opts = overwide::Options { respect_exports: true, ..Default::default() };
-    let findings = overwide::analyze(&root, &opts).unwrap().findings;
+    let opts = type_narrower::Options { respect_exports: true, ..Default::default() };
+    let findings = type_narrower::analyze(&root, &opts).unwrap().findings;
     // 06-cross-file-def.ts `log` is exported and must disappear in open-world mode.
     assert!(
         !findings.iter().any(|f| f.file.contains("06-cross-file-def")),
@@ -77,11 +77,11 @@ fn diff_parser_basics() {
 @@ -20,2 +25,0 @@
 ";
     let root = PathBuf::from("/repo");
-    let changed = overwide::diff::parse_unified_diff(diff, &root);
+    let changed = type_narrower::diff::parse_unified_diff(diff, &root);
     let ranges = changed.get(&root.join("src/a.ts")).unwrap();
     assert_eq!(ranges, &vec![(11, 13), (25, 25)]);
-    assert!(overwide::diff::intersects(ranges, 12, 40));
-    assert!(!overwide::diff::intersects(ranges, 14, 24));
+    assert!(type_narrower::diff::intersects(ranges, 12, 40));
+    assert!(!type_narrower::diff::intersects(ranges, 14, 24));
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn diff_parser_ignores_spoofed_headers() {
 +y
 ";
     let root = PathBuf::from("/repo");
-    let changed = overwide::diff::parse_unified_diff(diff, &root);
+    let changed = type_narrower::diff::parse_unified_diff(diff, &root);
     assert_eq!(changed.len(), 1, "spoofed header created a phantom file: {changed:?}");
     let ranges = changed.get(&root.join("src/a.ts")).unwrap();
     assert_eq!(ranges, &vec![(2, 2), (10, 10)]);
@@ -111,6 +111,6 @@ fn diff_parser_unquotes_c_quoted_paths() {
 @@ -1,1 +1,1 @@
 ";
     let root = PathBuf::from("/repo");
-    let changed = overwide::diff::parse_unified_diff(diff, &root);
+    let changed = type_narrower::diff::parse_unified_diff(diff, &root);
     assert!(changed.contains_key(&root.join("src/café.ts")), "got: {changed:?}");
 }

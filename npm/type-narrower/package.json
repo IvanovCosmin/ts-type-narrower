@@ -1,5 +1,5 @@
 {
-  "name": "overwide",
+  "name": "type-narrower",
   "version": "0.1.0",
   "description": "Static analysis for TypeScript that finds function parameters whose declared union types are wider than anything the call sites actually pass.",
   "keywords": ["typescript", "static-analysis", "union-types", "dead-code", "lint"],
@@ -7,11 +7,11 @@
   "author": "Cosmin Ivanov",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/IvanovCosmin/overwide.git"
+    "url": "git+https://github.com/IvanovCosmin/type-narrower.git"
   },
-  "homepage": "https://github.com/IvanovCosmin/overwide#readme",
+  "homepage": "https://github.com/IvanovCosmin/type-narrower#readme",
   "bin": {
-    "overwide": "bin/overwide.js"
+    "type-narrower": "bin/type-narrower.js"
   },
   "main": "lib/index.js",
   "files": ["bin", "lib"],
@@ -19,11 +19,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "overwide-linux-x64": "0.1.0",
-    "overwide-linux-x64-musl": "0.1.0",
-    "overwide-linux-arm64": "0.1.0",
-    "overwide-darwin-x64": "0.1.0",
-    "overwide-darwin-arm64": "0.1.0",
-    "overwide-win32-x64": "0.1.0"
+    "type-narrower-linux-x64": "0.1.0",
+    "type-narrower-linux-x64-musl": "0.1.0",
+    "type-narrower-linux-arm64": "0.1.0",
+    "type-narrower-darwin-x64": "0.1.0",
+    "type-narrower-darwin-arm64": "0.1.0",
+    "type-narrower-win32-x64": "0.1.0"
   }
 }

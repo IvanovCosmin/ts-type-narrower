@@ -1,5 +1,5 @@
 {
-  "name": "overwide-fixture",
+  "name": "type-narrower-fixture",
   "version": "0.1.0",
   "private": true,
   "description": "TypeScript toolchain only used to typecheck the fixture project; the analyzer itself is Rust (see Cargo.toml).",
