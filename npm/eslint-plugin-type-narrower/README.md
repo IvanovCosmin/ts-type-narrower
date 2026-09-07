@@ -30,11 +30,11 @@ Requires a TypeScript-capable parser (you almost certainly already use
 
 ```js
 // eslint.config.js
-import type-narrower from "eslint-plugin-type-narrower";
+import typeNarrower from "eslint-plugin-type-narrower";
 
 export default [
   // ...your typescript-eslint setup...
-  type-narrower.configs.recommended, // warns on **/*.ts,tsx,mts,cts
+  typeNarrower.configs.recommended, // warns on **/*.ts,tsx,mts,cts
 ];
 ```
 
