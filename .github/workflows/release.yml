@@ -42,7 +42,8 @@ jobs:
             os: ubuntu-24.04-arm
           - npm_pkg: type-narrower-darwin-x64
             target: x86_64-apple-darwin
-            os: macos-13
+            # Intel runners (macos-13) are retired; cross-compile on arm64.
+            os: macos-14
           - npm_pkg: type-narrower-darwin-arm64
             target: aarch64-apple-darwin
             os: macos-14
