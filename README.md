@@ -16,6 +16,35 @@ carries its own conservative resolver for the subset it analyzes (literal
 unions, nested object types, enums, aliases/interfaces across imports) and
 bails to "no finding" on anything it cannot prove.
 
+## ESLint plugin
+
+overwide ships as an npm package pair:
+[`eslint-plugin-overwide`](https://www.npmjs.com/package/eslint-plugin-overwide)
+(the plugin) and [`overwide`](https://www.npmjs.com/package/overwide) (the CLI
+with prebuilt binaries per platform, pulled in automatically). The plugin runs
+the whole-project analysis once per lint run and maps findings onto each
+linted file:
+
+```js
+// eslint.config.js
+import overwide from "eslint-plugin-overwide";
+export default [
+  // ...your typescript-eslint setup...
+  overwide.configs.recommended,
+];
+```
+
+See `npm/eslint-plugin-overwide/README.md` for rule options
+(`projectRoot`, `respectExports`, `cacheMs`, ...) and the legacy
+`.eslintrc` form.
+
+Releasing: bump the version in `Cargo.toml`, `npm/overwide/package.json`
+(including its optionalDependencies), and
+`npm/eslint-plugin-overwide/package.json` (including its `overwide`
+dependency), then push a `v<version>` tag. `.github/workflows/release.yml`
+cross-builds the six platform binaries and publishes all eight packages to
+npm; it needs an `NPM_TOKEN` repository secret (npm automation token).
+
 ## Usage
 
 ```

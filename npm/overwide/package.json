@@ -1,0 +1,29 @@
+{
+  "name": "overwide",
+  "version": "0.1.0",
+  "description": "Static analysis for TypeScript that finds function parameters whose declared union types are wider than anything the call sites actually pass.",
+  "keywords": ["typescript", "static-analysis", "union-types", "dead-code", "lint"],
+  "license": "MIT",
+  "author": "Cosmin Ivanov",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IvanovCosmin/overwide.git"
+  },
+  "homepage": "https://github.com/IvanovCosmin/overwide#readme",
+  "bin": {
+    "overwide": "bin/overwide.js"
+  },
+  "main": "lib/index.js",
+  "files": ["bin", "lib"],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "overwide-linux-x64": "0.1.0",
+    "overwide-linux-x64-musl": "0.1.0",
+    "overwide-linux-arm64": "0.1.0",
+    "overwide-darwin-x64": "0.1.0",
+    "overwide-darwin-arm64": "0.1.0",
+    "overwide-win32-x64": "0.1.0"
+  }
+}
