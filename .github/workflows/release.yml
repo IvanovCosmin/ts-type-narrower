@@ -68,6 +68,9 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write # failure-log branch below; publishing itself only reads
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -108,3 +111,15 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd npm/eslint-plugin-type-narrower && npm publish --access public --provenance
+      - name: Push npm error log to ci-logs branch on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          log=$(ls -t /home/runner/.npm/_logs/*.log 2>/dev/null | head -1)
+          { [ -n "$log" ] && tail -c 40000 "$log"; } > /tmp/npmlog.txt || echo "no npm debug log found" > /tmp/npmlog.txt
+          sha=$(curl -s -H "Authorization: Bearer $GH_TOKEN"             "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/heads/main"             | python3 -c "import json,sys; print(json.load(sys.stdin)['object']['sha'])")
+          curl -s -X POST -H "Authorization: Bearer $GH_TOKEN"             "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs"             -d "{"ref":"refs/heads/ci-logs","sha":"$sha"}" | head -c 120 || true
+          b64=$(base64 -w0 /tmp/npmlog.txt)
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN"             "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/npm-error-${GITHUB_RUN_ID}.log"             -d "{"message":"ci npm error log ${GITHUB_RUN_ID}","branch":"ci-logs","content":"$b64"}" | head -c 200
