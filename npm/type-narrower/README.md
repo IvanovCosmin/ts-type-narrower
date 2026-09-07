@@ -1,6 +1,6 @@
 # type-narrower (npm distribution)
 
-Prebuilt binaries for [type-narrower](https://github.com/IvanovCosmin/type-narrower),
+Prebuilt binaries for [type-narrower](https://github.com/IvanovCosmin/ts-type-narrower),
 a static analyzer that finds TypeScript function parameters whose declared
 union types are wider than anything the call sites actually pass.
 
@@ -27,5 +27,5 @@ const report = analyze("/path/to/repo", { respectExports: false });
 // { version, findings, stats, uncalled, warnings }
 ```
 
-See the [project README](https://github.com/IvanovCosmin/type-narrower) for the
+See the [project README](https://github.com/IvanovCosmin/ts-type-narrower) for the
 rule definition, soundness contract, CLI flags, and performance numbers.

@@ -45,7 +45,7 @@ const pkg = {
   version,
   description: `type-narrower binary for ${meta.os}-${meta.cpu}${meta.libc === "musl" ? " (musl)" : ""}`,
   license: "MIT",
-  repository: { type: "git", url: "git+https://github.com/IvanovCosmin/type-narrower.git" },
+  repository: { type: "git", url: "git+https://github.com/IvanovCosmin/ts-type-narrower.git" },
   os: [meta.os],
   cpu: [meta.cpu],
   files: ["bin"],

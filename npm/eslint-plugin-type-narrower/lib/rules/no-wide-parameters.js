@@ -9,7 +9,7 @@ module.exports = {
     docs: {
       description:
         "Report function parameters whose declared union types contain constituents no call site ever passes",
-      url: "https://github.com/IvanovCosmin/type-narrower#the-rule",
+      url: "https://github.com/IvanovCosmin/ts-type-narrower#the-rule",
     },
     schema: [
       {

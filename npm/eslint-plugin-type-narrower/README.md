@@ -1,6 +1,6 @@
 # eslint-plugin-type-narrower
 
-Surfaces [type-narrower](https://github.com/IvanovCosmin/type-narrower) findings in
+Surfaces [type-narrower](https://github.com/IvanovCosmin/ts-type-narrower) findings in
 ESLint: function parameters whose declared union types contain constituents no
 call site ever passes.
 
@@ -74,5 +74,5 @@ you can inspect by running the `type-narrower` CLI directly.
 Everything the analyzer cannot prove degrades to *not reporting*: spread
 arguments, `as any`, unresolvable imports, overloads, generics, rest
 parameters all suppress findings rather than fabricate them. See the
-[project README](https://github.com/IvanovCosmin/type-narrower#the-soundness-invariant)
+[project README](https://github.com/IvanovCosmin/ts-type-narrower#the-soundness-invariant)
 for the full contract and known limits.
