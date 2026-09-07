@@ -7,14 +7,129 @@ union types are wider than anything the call sites actually pass.
 type Channel = "email" | "sms" | "push" | "fax";
 function send(channel: Channel) {}
 send("email"); send("sms"); send("push");
-// -> send(channel): never passed: "fax"
 ```
+
+```
+src/notify.ts:4  send(channel): declared "email" | "sms" | "push" | "fax",
+                 never passed: "fax"  [3 calls: src/notify.ts:8, src/notify.ts:9, src/notify.ts:10]
+```
+
+`Channel` should have been three constituents. `"fax"` is either dead code the
+compiler will never flag, or a case someone forgot to wire up.
 
 Written in Rust on top of the [oxc](https://oxc.rs) parser, with rayon for
 per-file parallelism. There is no TypeScript type checker underneath: the tool
 carries its own conservative resolver for the subset it analyzes (literal
 unions, nested object types, enums, aliases/interfaces across imports) and
 bails to "no finding" on anything it cannot prove.
+
+## What it finds
+
+Each case below is taken from `fixture/`, with the tool's own output beneath
+it (long call-site lists elided).
+
+**Object properties, per path.** Nested non-union objects are walked, and each
+leaf union is reported separately:
+
+```ts
+type Config = {
+  mode: "dev" | "prod" | "test";
+  opts: { level: 1 | 2 | 3; log: { format: "json" | "pretty" | "syslog"; color: boolean } };
+};
+function configure(config: Config) {}
+
+configure({ mode: "dev",  opts: { level: 1, log: { format: "json",   color: true } } });
+configure({ mode: "prod", opts: { level: 2, log: { format: "pretty", color: true } } });
+```
+
+```
+src/05-nested.ts:14  configure(config).mode: declared "dev" | "prod" | "test", never passed: "test"
+src/05-nested.ts:14  configure(config).opts.level: declared 1 | 2 | 3, never passed: 3
+src/05-nested.ts:14  configure(config).opts.log.color: declared boolean, never passed: false
+src/05-nested.ts:14  configure(config).opts.log.format: declared "json" | "pretty" | "syslog", never passed: "syslog"
+```
+
+`boolean` narrows as `true | false`, so a flag that is only ever passed `true`
+is a finding too.
+
+**Discriminated unions.** Object literals are matched structurally against
+variants, so a variant nobody constructs is reported whole:
+
+```ts
+type Request =
+  | { type: "user"; id: number }
+  | { type: "post"; slug: string }
+  | { type: "comment"; postId: number; index: number }
+  | { type: "admin"; token: string };
+function process(request: Request) {}
+
+process({ type: "user", id: 1 });
+process({ type: "post", slug: "hello" });
+process({ type: "comment", postId: 1, index: 0 });
+```
+
+```
+src/04-discriminated.ts:8  process(request): declared { type: "user"; id: number; } | { type: "post"; slug: string; }
+                           | { type: "comment"; postId: number; index: number; } | { type: "admin"; token: string; },
+                           never passed: { type: "admin"; token: string; }  [3 calls: …]
+```
+
+**Enums**, by member:
+
+```ts
+enum Priority { Low, Medium, High, Critical }
+function schedule(priority: Priority) {}
+schedule(Priority.Low);
+schedule(Priority.Medium);
+```
+
+```
+src/13-enums.ts:9  schedule(priority): declared Priority.Low | Priority.Medium | Priority.High | Priority.Critical,
+                   never passed: Priority.High, Priority.Critical  [2 calls: …]
+```
+
+**React props.** JSX usage of a function component is a call, and the
+attributes object is the argument. Destructured parameters analyze against
+their annotation:
+
+```tsx
+type ChipProps = { tone: "t1" | "t2" | "t3"; size: "s" | "m" | "l" };
+function Chip({ tone, size }: ChipProps) { return null; }
+
+export const c1 = <Chip tone="t1" size="s" />;
+export const c2 = <Chip tone="t2" size="s" />;
+```
+
+```
+src/26-destructured.tsx:9  Chip({tone, size}).size: declared "s" | "m" | "l", never passed: "m", "l"
+src/26-destructured.tsx:9  Chip({tone, size}).tone: declared "t1" | "t2" | "t3", never passed: "t3"
+```
+
+**Forwarded values narrow transitively.** Each destructured name binds to a
+property projection, so a prop handed to another function carries its narrowed
+type with it — `pinner` is reported even though nothing calls it with a literal:
+
+```ts
+function pinner(t: "p1" | "p2" | "p3") {}
+function pouter({ tone }: { tone: "p1" | "p2" }) { pinner(tone); }
+pouter({ tone: "p1" });
+pouter({ tone: "p2" });
+```
+
+```
+src/26-destructured.tsx:22  pinner(t): declared "p1" | "p2" | "p3", never passed: "p3"  [1 call: …]
+```
+
+Call sites in other files count the same way — declaration and evidence
+routinely live in different modules, which is why the analysis is
+whole-project rather than per-file.
+
+Under ESLint the same finding reads:
+
+```
+warning  Parameter 'channel' of 'send' is declared as "email" | "sms" | "push" | "fax"
+         but its 3 call site(s) never pass: "fax".
+```
 
 ## ESLint plugin
 
@@ -27,10 +142,10 @@ linted file:
 
 ```js
 // eslint.config.js
-import type-narrower from "eslint-plugin-type-narrower";
+import typeNarrower from "eslint-plugin-type-narrower";
 export default [
   // ...your typescript-eslint setup...
-  type-narrower.configs.recommended,
+  typeNarrower.configs.recommended,
 ];
 ```
 
@@ -77,83 +192,41 @@ for parse errors or unreadable files (suppress with `--quiet`).
 the whole repo; analyzing a sub-package hides its external callers, and the
 tool warns when the analysis root is not the git top-level.
 
-## The rule
+## What is excepted from analysis
 
-For a function `f`, only direct `CallExpression`s (and JSX usages of function
-components) whose callee resolves to `f` are considered. A union constituent is
-reported only when **every** observed call provably excludes it:
+Everything the tool cannot prove degrades to silence, never to a false
+finding. A function is excluded outright, and will never be reported, when it:
 
-- literal arguments count as their literal type;
-- identifiers count as their `const`/parameter annotation, or their literal
-  initializer for un-annotated `const`s;
-- `x as T` counts as `T` (so `as any` covers everything);
-- object literals are matched structurally against object/variant types, and
-  the analysis recurses into nested (non-union) object properties, reporting
-  per property path (`configure(config).opts.level: never passed: 3`);
-- `enum` parameters narrow by member (`Priority.High` never passed);
-- `boolean` narrows as `true | false`; `undefined` introduced by `?` or a
-  default initializer is never reported;
-- a constituent subsumed by an observation counts as used (an argument typed
-  `string` against `"fast" | string` can carry `"fast"`);
-- anything unprovable (spread arguments, wide or opaque argument types,
-  `any`/`unknown`) marks *all* constituents as used.
+- is generic, is overloaded, takes a rest parameter, or takes no parameters;
+- is referenced anywhere outside callee position — passed as a value, stored
+  in an object, exported as a value — since any holder can call it;
+- is reachable through a call the linker cannot attribute to one declaration
+  (a call through an unresolvable import, a shadowed or unbound callee, a
+  method on an unknown receiver): every same-named function escapes;
+- is a class method reached via `this.method()`, via a class or namespace
+  binding used as a value, or by inheritance from an unknown base;
+- is passed as a callback, except to array higher-order methods on a provably
+  array receiver (`map`, `filter`, `sort`, …) and to JSX intrinsic handlers
+  (`<button onClick={h}/>`), where the invocation contract is statically known.
 
-## The soundness invariant
+Individual parameters stay wide when their type is a tuple, an intersection, a
+generic instantiation, or an array-destructuring pattern; unions are terminal,
+so there is no recursion into a union's variants. A single unprovable argument
+at any call site — a spread, an `as any`, an `any`/`unknown`-typed value —
+marks every constituent of that parameter as used.
 
-Every failure mode must degrade to *under-reporting*. The linker enforces one
-rule everywhere: **a reference that cannot be resolved to a specific
-declaration never disappears — it escapes every declaration it could plausibly
-denote.** Concretely:
+Module resolution covers relative imports (dotted filenames, `.js`/`.mjs`
+NodeNext specifiers), named/default/namespace imports, dynamic `import()` and
+`require()`, re-export chains and barrels, tsconfig `paths`/`baseUrl`, and
+workspace package names. Scope handling is function-granular: a name declared
+anywhere in a body shadows outer scopes for the whole function, so
+block-scoped shadowing degrades to opaque observations rather than wrong
+bindings.
 
-- calls through unresolvable imports (external packages, unknown aliases)
-  escape every same-named exported function;
-- unattributable identifier calls (shadowed or unbound callees) escape every
-  same-named free function;
-- unattributable method calls and property accesses escape every same-named
-  method *and* free function (namespace-like objects can carry both);
-- a tracked object/class/namespace binding used as a value escapes all of its
-  members / the source module's exports;
-- inherited or unknown methods on resolved classes fall back to name-based
-  escapes.
-
-Module resolution covers: relative imports (including dotted filenames like
-`foo.service.ts` and `.js`/`.mjs`-suffixed NodeNext specifiers), named and
-default exports/imports, namespace imports (`import * as ns` — `ns.f(...)` is
-a real call), `const m = await import("./x")` and `require("./x")`, re-export
-chains in every form (`export { x } from`, `export * from`,
-`export * as ns from`, and import-then-export barrels), tsconfig
-`paths`/`baseUrl` from every `tsconfig*.json` under the root (BOM-tolerant
-JSONC), and workspace package names (`package.json` `name` fields). A private
-local declaration never satisfies an import of the same name.
-
-A function is skipped entirely when analysis would be unsound for it:
-any reference outside callee position, overloads, generics, rest parameters.
-Destructured object parameters are analyzed against their annotation
-(`function Badge({ variant }: BadgeProps)` reports per-property paths), and
-each destructured name binds to a property projection of the annotation, so a
-forwarded prop narrows its callee too; array-pattern parameters are opaque. Scope handling is function-granular: every name
-declared anywhere in a function body shadows outer scopes for the whole
-function, so block-scoped shadowing degrades to escapes/opaque observations
-rather than wrong bindings; annotations mentioning function-local type
-declarations resolve to opaque.
-
-Functions passed as callbacks are modeled instead of escaped in two cases
-where the invocation contract is statically known: array higher-order methods
-(`map`, `forEach`, `filter`, `find`, `some`, `every`, `flatMap`, `sort`, …)
-when the receiver is provably an array (an `E[]`/`Array<E>` annotation, an
-array literal, or an `as const`/`as E[]` cast) — the callback observes
-(element, index, array); and JSX intrinsic-element handlers
-(`<button onClick={h}/>`), which the DOM/JSX runtime invokes with exactly one
-event argument, so trailing optional parameters are provably never provided.
-Callbacks passed to user methods, component props, or `addEventListener`
-still escape — those receivers can call with anything.
-
-Known limits (all degrade to under-reporting, never over-reporting): unions
-are terminal (no per-variant recursion), tuples/generics/intersections
-are opaque (array types are modeled), class components and `this.method()` escape broadly, symlinked
-directories are skipped, and files with parse errors or non-UTF8 content are
-analyzed partially with a loud stderr warning (their missing call sites are
-the one place the guarantee is knowingly best-effort).
+The one place the guarantee is knowingly best-effort: files with parse errors
+or non-UTF8 content are analyzed partially, and their missing call sites can
+produce a wrong finding. Those files are named in a loud stderr warning and in
+the JSON report's `warnings`.
 
 ## Layout
 
