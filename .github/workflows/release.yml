@@ -96,13 +96,15 @@ jobs:
                      type-narrower-darwin-x64 type-narrower-darwin-arm64 type-narrower-win32-x64; do
             bin=$(ls binaries/$pkg/type-narrower*)
             node scripts/make-platform-package.mjs "$pkg" "$bin" "dist/$pkg"
-            npm publish "dist/$pkg" --access public --provenance
+            # npm parses a bare name/name argument as a GitHub shorthand, not a
+            # folder — publish from inside the directory instead.
+            (cd "dist/$pkg" && npm publish --access public --provenance)
           done
       - name: Publish type-narrower
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish npm/type-narrower --access public --provenance
+        run: cd npm/type-narrower && npm publish --access public --provenance
       - name: Publish eslint-plugin-type-narrower
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish npm/eslint-plugin-type-narrower --access public --provenance
+        run: cd npm/eslint-plugin-type-narrower && npm publish --access public --provenance
