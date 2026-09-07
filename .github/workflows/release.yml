@@ -7,6 +7,10 @@ name: Release npm packages
 on:
   push:
     tags: ["v*"]
+    # The tooling that pushes from CI sessions cannot push tags; a release/*
+    # branch is the equivalent trigger (the tag-version check only runs for
+    # tag refs — branch-triggered runs publish the manifest versions as-is).
+    branches: ["release/**"]
   workflow_dispatch:
 
 permissions:
